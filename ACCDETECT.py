@@ -1,7 +1,11 @@
 """
 ================================================================================
-  BOT DISCORD - DETECTION DE COMPTES RARES
-  buyer/owner · base SQLite · !set interactif · emojis perso · niveau de rarete
+  BOT DISCORD - DETECTION DE COMPTES RARES (version enrichie)
+  buyer/owner · SQLite · !set/!scan par categorie · boost · niveau de rarete
+================================================================================
+NOTE: les badges Nitro (Bronze..Opale) ne sont PAS exposes par l'API Discord et
+ne peuvent donc pas etre detectes par un bot. On detecte a la place le BOOST de
+ce serveur (via premium_since) et un "Nitro probable" (avatar anime/banniere).
 ================================================================================
 """
 
@@ -11,8 +15,6 @@ import sqlite3
 import discord
 from discord.ext import commands
 
-# Detection de vrais mots (FR/EN) via wordfreq. Si la lib manque, on desactive
-# juste ce critere sans planter le bot.
 try:
     from wordfreq import zipf_frequency
     WORDFREQ_OK = True
@@ -20,14 +22,12 @@ except ImportError:
     WORDFREQ_OK = False
 
 # ==============================================================================
-#  REGLAGES DE BASE  --  A MODIFIER
+#  REGLAGES DE BASE
 # ==============================================================================
 
 BUYER_ID = 142365250803466240
 TOKEN = os.environ.get("DISCORD_TOKEN", "COLLE_TON_TOKEN_ICI_SI_TU_VEUX")
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
-
-# Seuil au-dessus duquel un pseudo est considere comme un "vrai mot".
 SEUIL_MOT = 2.5
 
 OG_SEUILS = [
@@ -36,8 +36,13 @@ OG_SEUILS = [
     ("og2018", datetime.datetime(2018, 1, 1, tzinfo=datetime.timezone.utc)),
 ]
 
+# Paliers de boost (mois -> cle), du plus haut au plus bas.
+BOOST_PALIERS = [(24, "boost24"), (18, "boost18"), (15, "boost15"), (12, "boost12"),
+                 (9, "boost9"), (6, "boost6"), (3, "boost3"), (2, "boost2"), (1, "boost1")]
+BOOST_MOIS = {k: m for m, k in BOOST_PALIERS}
+
 # ==============================================================================
-#  CATALOGUE DES ELEMENTS
+#  CATALOGUE
 # ==============================================================================
 
 SET_ITEMS = {
@@ -52,59 +57,75 @@ SET_ITEMS = {
     "mod":        {"label": "Moderator Programs Alumni",  "type": "role"},
     "partner":    {"label": "Partenaire Discord",         "type": "role"},
     "staff":      {"label": "Staff Discord",              "type": "role"},
-    "og2016":     {"label": "OG - compte avant 2016",     "type": "role"},
-    "og2017":     {"label": "OG - compte avant 2017",     "type": "role"},
-    "og2018":     {"label": "OG - compte avant 2018",     "type": "role"},
+    "nitro":      {"label": "Nitro (probable)",           "type": "role"},
+    "boost1":     {"label": "Boost 1 mois",               "type": "role"},
+    "boost2":     {"label": "Boost 2 mois",               "type": "role"},
+    "boost3":     {"label": "Boost 3 mois",               "type": "role"},
+    "boost6":     {"label": "Boost 6 mois",               "type": "role"},
+    "boost9":     {"label": "Boost 9 mois",               "type": "role"},
+    "boost12":    {"label": "Boost 12 mois",              "type": "role"},
+    "boost15":    {"label": "Boost 15 mois",              "type": "role"},
+    "boost18":    {"label": "Boost 18 mois",              "type": "role"},
+    "boost24":    {"label": "Boost 24 mois",              "type": "role"},
+    "og2016":     {"label": "OG - avant 2016",            "type": "role"},
+    "og2017":     {"label": "OG - avant 2017",            "type": "role"},
+    "og2018":     {"label": "OG - avant 2018",            "type": "role"},
     "pseudo2":    {"label": "Pseudo de 2 caracteres",     "type": "role"},
     "pseudo3":    {"label": "Pseudo de 3 caracteres",     "type": "role"},
     "mot":        {"label": "Pseudo : vrai mot (FR/EN)",  "type": "role"},
     "chiffres":   {"label": "Pseudo : que des chiffres",  "type": "role"},
+    "alertrole":  {"label": "Role a ping (alertes)",      "type": "role"},
     "logs":       {"label": "Salon de logs (joins)",      "type": "channel"},
     "scanlog":    {"label": "Salon de scan",              "type": "channel"},
 }
 
 CATEGORIES = {
-    "🏅 Badges":     ["early", "hypesquad", "bravery", "brilliance", "balance",
-                      "bughunter", "bughunter2", "botdev", "mod", "partner", "staff"],
-    "📅 Anciennete": ["og2016", "og2017", "og2018"],
-    "✨ Pseudo":     ["pseudo2", "pseudo3", "mot", "chiffres"],
-    "📋 Salons":     ["logs", "scanlog"],
+    "🏅 Badges":        ["early", "hypesquad", "bravery", "brilliance", "balance",
+                         "bughunter", "bughunter2", "botdev", "mod", "partner", "staff"],
+    "💎 Nitro & Boost": ["nitro", "boost1", "boost2", "boost3", "boost6", "boost9",
+                         "boost12", "boost15", "boost18", "boost24"],
+    "📅 Anciennete":    ["og2016", "og2017", "og2018"],
+    "✨ Pseudo":        ["pseudo2", "pseudo3", "mot", "chiffres"],
+    "🚨 Alerte":        ["alertrole"],
+    "📋 Salons":        ["logs", "scanlog"],
 }
 
-# Cles "detectables" (utilisables pour scan/list/emoji) = tout sauf les salons.
-DETECT_KEYS = [k for k, v in SET_ITEMS.items() if v["type"] == "role"]
+# Cles que l'on sait detecter (pour scan/list/stats/top).
+DETECT_KEYS = [k for k, v in SET_ITEMS.items() if v["type"] == "role" and k != "alertrole"]
 
-# Emojis par defaut (remplaçables par !setemoji avec tes propres emojis).
 DEFAULT_EMOJIS = {
-    "early": "🥇", "hypesquad": "🎉", "bravery": "🛡️", "brilliance": "🔮",
-    "balance": "⚖️", "bughunter": "🐛", "bughunter2": "🐛", "botdev": "🤖",
-    "mod": "🛡️", "partner": "🤝", "staff": "👑",
+    "early": "🥇", "hypesquad": "🎉", "bravery": "🛡️", "brilliance": "🔮", "balance": "⚖️",
+    "bughunter": "🐛", "bughunter2": "🐛", "botdev": "🤖", "mod": "🛡️", "partner": "🤝", "staff": "👑",
+    "nitro": "💎", "boost1": "🚀", "boost2": "🚀", "boost3": "🚀", "boost6": "🚀", "boost9": "🚀",
+    "boost12": "🚀", "boost15": "🚀", "boost18": "🚀", "boost24": "🚀",
     "og2016": "📅", "og2017": "📅", "og2018": "📅",
     "pseudo2": "✨", "pseudo3": "✨", "mot": "🔤", "chiffres": "🔢",
 }
 
 JOIN_TITRE_DEFAUT = "🌟 Un compte rare a rejoint le serveur !"
 
-# Poids pour le calcul du niveau de rarete.
+# --- Bareme de rarete ---
 POIDS = {
-    "staff": 6, "partner": 5, "botdev": 4, "bughunter2": 4, "mod": 3, "bughunter": 3,
-    "hypesquad": 2, "early": 2, "bravery": 1, "brilliance": 1, "balance": 1,
-    "og2016": 3, "og2017": 2, "og2018": 1,
-    "pseudo2": 3, "pseudo3": 2, "mot": 2, "chiffres": 1,
+    "staff": 8, "partner": 6, "botdev": 5, "bughunter2": 5, "mod": 4, "bughunter": 4,
+    "hypesquad": 3, "early": 3, "bravery": 1, "brilliance": 1, "balance": 1,
+    "og2016": 4, "og2017": 3, "og2018": 2,
+    "pseudo2": 4, "pseudo3": 3, "mot": 2, "chiffres": 1,
+    "nitro": 1,
+    "boost1": 1, "boost2": 1, "boost3": 2, "boost6": 2, "boost9": 3,
+    "boost12": 3, "boost15": 4, "boost18": 4, "boost24": 5,
 }
 
-# Paliers de niveau : (score minimum, nom, couleur).
 NIVEAUX = [
     (0,  "Commun",      discord.Color.light_grey()),
-    (1,  "Peu commun",  discord.Color.green()),
-    (3,  "Rare",        discord.Color.blue()),
-    (5,  "Epique",      discord.Color.purple()),
-    (8,  "Legendaire",  discord.Color.gold()),
-    (12, "Mythique",    discord.Color.red()),
+    (2,  "Peu commun",  discord.Color.green()),
+    (4,  "Rare",        discord.Color.blue()),
+    (7,  "Epique",      discord.Color.purple()),
+    (11, "Legendaire",  discord.Color.gold()),
+    (16, "Mythique",    discord.Color.red()),
 ]
 
 # ==============================================================================
-#  BASE DE DONNEES (SQLite)
+#  BASE DE DONNEES
 # ==============================================================================
 
 def db():
@@ -117,13 +138,12 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS owners   (user_id INTEGER PRIMARY KEY)")
     conn.execute("CREATE TABLE IF NOT EXISTS emojis   (key TEXT PRIMARY KEY, emoji TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS messages (key TEXT PRIMARY KEY, contenu TEXT)")
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 
-def _charger(table, cols):
+def _charger(table, c1, c2):
     conn = db()
-    rows = conn.execute(f"SELECT {cols[0]}, {cols[1]} FROM {table}").fetchall()
+    rows = conn.execute(f"SELECT {c1}, {c2} FROM {table}").fetchall()
     conn.close()
     return {k: v for k, v in rows}
 
@@ -153,9 +173,7 @@ def definir_message(key, contenu):
 
 
 def charger_owners():
-    conn = db()
-    rows = conn.execute("SELECT user_id FROM owners").fetchall()
-    conn.close()
+    conn = db(); rows = conn.execute("SELECT user_id FROM owners").fetchall(); conn.close()
     return {r[0] for r in rows}
 
 
@@ -165,14 +183,14 @@ def ajouter_owner(uid):
 
 
 def retirer_owner(uid):
-    conn = db(); conn.execute("DELETE FROM owners WHERE user_id = ?", (uid,))
+    conn = db(); conn.execute("DELETE FROM owners WHERE user_id=?", (uid,))
     conn.commit(); conn.close(); OWNERS.discard(uid)
 
 
 init_db()
-CONFIG = _charger("config", ("key", "value"))
-EMOJIS = _charger("emojis", ("key", "emoji"))
-MESSAGES = _charger("messages", ("key", "contenu"))
+CONFIG = _charger("config", "key", "value")
+EMOJIS = _charger("emojis", "key", "emoji")
+MESSAGES = _charger("messages", "key", "contenu")
 OWNERS = charger_owners()
 
 
@@ -185,7 +203,7 @@ def message_de(key, defaut):
 
 
 # ==============================================================================
-#  HIERARCHIE / PERMISSIONS
+#  PERMISSIONS
 # ==============================================================================
 
 def est_buyer(uid): return uid == BUYER_ID
@@ -235,9 +253,8 @@ def detecter_badges(user):
 
 
 def detecter_anciennete(user):
-    cree = user.created_at
     for key, limite in OG_SEUILS:
-        if cree < limite:
+        if user.created_at < limite:
             return key
     return None
 
@@ -249,8 +266,6 @@ def est_mot(nom):
 
 
 def detecter_pseudo(user):
-    """Pseudo rare = 2 ou 3 caracteres, OU un vrai mot, OU que des chiffres.
-    (Un pseudo "que des lettres" sans etre un mot n'est PAS considere rare.)"""
     nom = user.name
     out = []
     if len(nom) == 2:
@@ -264,12 +279,59 @@ def detecter_pseudo(user):
     return out
 
 
+def mois_de_boost(member):
+    """Nombre de mois de boost de CE serveur, ou None si le membre ne boost pas."""
+    since = getattr(member, "premium_since", None)
+    if not since:
+        return None
+    delta = datetime.datetime.now(datetime.timezone.utc) - since
+    return delta.days / 30.44
+
+
+def detecter_boost(member):
+    mois = mois_de_boost(member)
+    if mois is None:
+        return None
+    for seuil, key in BOOST_PALIERS:
+        if mois >= seuil:
+            return key
+    return "boost1"  # boost depuis moins d'un mois
+
+
+def detecter_nitro_probable(member):
+    """Indices de Nitro lisibles par un bot (pas le palier exact)."""
+    try:
+        if member.display_avatar and member.display_avatar.is_animated():
+            return True
+    except Exception:
+        pass
+    if getattr(member, "avatar_decoration", None):
+        return True
+    return False
+
+
+def collecter_infos(member):
+    return {
+        "badges": detecter_badges(member),
+        "pseudo": detecter_pseudo(member),
+        "anciennete": detecter_anciennete(member),
+        "boost": detecter_boost(member),
+        "nitro": detecter_nitro_probable(member),
+        "erreurs": [],
+    }
+
+
 OG_THRESHOLDS = dict(OG_SEUILS)
 
 
 def membre_a_cle(member, key):
     if key in OG_THRESHOLDS:
         return member.created_at < OG_THRESHOLDS[key]
+    if key in BOOST_MOIS:
+        mois = mois_de_boost(member)
+        return mois is not None and mois >= BOOST_MOIS[key]
+    if key == "nitro":
+        return detecter_nitro_probable(member)
     if key in ("pseudo2", "pseudo3", "mot", "chiffres"):
         return key in detecter_pseudo(member)
     return key in detecter_badges(member)
@@ -280,15 +342,13 @@ def membres_avec(guild, key):
 
 
 async def appliquer_roles(member):
-    infos = {
-        "badges": detecter_badges(member),
-        "pseudo": detecter_pseudo(member),
-        "anciennete": detecter_anciennete(member),
-        "erreurs": [],
-    }
+    infos = collecter_infos(member)
     cles = list(infos["badges"]) + list(infos["pseudo"])
-    if infos["anciennete"]:
-        cles.append(infos["anciennete"])
+    for extra in (infos["anciennete"], infos["boost"]):
+        if extra:
+            cles.append(extra)
+    if infos["nitro"]:
+        cles.append("nitro")
     role_ids = {CONFIG.get(c, 0) for c in cles}
     role_ids.discard(0)
     roles = [r for rid in role_ids if (r := member.guild.get_role(rid)) and r not in member.roles]
@@ -302,8 +362,12 @@ async def appliquer_roles(member):
     return infos
 
 
+def est_notable(infos):
+    return bool(infos["badges"] or infos["pseudo"] or infos["anciennete"] or infos["boost"] or infos["nitro"])
+
+
 # ==============================================================================
-#  NIVEAU DE RARETE
+#  RARETE
 # ==============================================================================
 
 def score_rarete(infos):
@@ -311,6 +375,10 @@ def score_rarete(infos):
     s += sum(POIDS.get(p, 0) for p in infos["pseudo"])
     if infos["anciennete"]:
         s += POIDS.get(infos["anciennete"], 0)
+    if infos["boost"]:
+        s += POIDS.get(infos["boost"], 0)
+    if infos["nitro"]:
+        s += POIDS.get("nitro", 0)
     return s
 
 
@@ -323,8 +391,15 @@ def niveau_rarete(infos):
     return s, nom, couleur
 
 
+def exceptionnel(infos):
+    _, niveau, _ = niveau_rarete(infos)
+    if niveau in ("Legendaire", "Mythique"):
+        return True
+    return any(b in infos["badges"] for b in ("staff", "partner", "bughunter2"))
+
+
 # ==============================================================================
-#  CONSTRUCTION DES EMBEDS DE PROFIL (join + check)
+#  EMBED PROFIL (join + profil)
 # ==============================================================================
 
 def embed_profil(member, infos, titre):
@@ -340,20 +415,29 @@ def embed_profil(member, infos, titre):
     embed.add_field(name="💎 Niveau", value=f"**{niveau}** ({score} pts)", inline=True)
     embed.add_field(name="📅 Compte cree",
                     value=f"<t:{int(member.created_at.timestamp())}:D>\n(il y a {annees} an(s) et {jours} j)",
-                    inline=False)
+                    inline=True)
+    if member.joined_at:
+        embed.add_field(name="📥 A rejoint", value=f"<t:{int(member.joined_at.timestamp())}:R>", inline=True)
+    embed.add_field(name="💠 Nitro probable", value="Oui" if infos["nitro"] else "Non", inline=True)
 
-    if infos["badges"]:
-        liste = "\n".join(f"{emoji_de(b)} {SET_ITEMS[b]['label']}" for b in infos["badges"])
-    else:
-        liste = "Aucun badge rare"
+    # Badges
+    liste = "\n".join(f"{emoji_de(b)} {SET_ITEMS[b]['label']}" for b in infos["badges"]) or "Aucun badge rare"
     embed.add_field(name="🏅 Badges", value=liste, inline=False)
 
-    elements_pseudo = list(infos["pseudo"])
-    if infos["anciennete"]:
-        elements_pseudo.append(infos["anciennete"])
-    if elements_pseudo:
-        details = ", ".join(f"{emoji_de(k)} {SET_ITEMS[k]['label']}" for k in elements_pseudo)
+    # Particularites (pseudo + anciennete + boost)
+    parts = list(infos["pseudo"])
+    for extra in (infos["anciennete"], infos["boost"]):
+        if extra:
+            parts.append(extra)
+    if parts:
+        details = ", ".join(f"{emoji_de(k)} {SET_ITEMS[k]['label']}" for k in parts)
         embed.add_field(name="✨ Particularites", value=details, inline=False)
+
+    # Mini-categorie "points forts" : les elements les plus rares
+    forts = [k for k in (list(infos["badges"]) + parts) if POIDS.get(k, 0) >= 3]
+    if forts:
+        embed.add_field(name="⭐ Points forts",
+                        value=", ".join(SET_ITEMS[k]["label"] for k in forts), inline=False)
 
     if infos["erreurs"]:
         embed.add_field(name="⚠️ Attention", value="\n".join(infos["erreurs"]), inline=False)
@@ -370,50 +454,26 @@ async def ajouter_banniere(embed, member):
 
 
 async def envoyer_log_join(guild, member, infos):
-    log_id = CONFIG.get("logs", 0)
-    if not log_id:
-        return
-    salon = guild.get_channel(log_id)
+    salon = guild.get_channel(CONFIG.get("logs", 0))
     if salon is None:
         return
-    titre = message_de("join", JOIN_TITRE_DEFAUT)
-    embed = embed_profil(member, infos, titre)
+    embed = embed_profil(member, infos, message_de("join", JOIN_TITRE_DEFAUT))
     embed.set_footer(text=guild.name)
     await ajouter_banniere(embed, member)
+    content = None
+    if exceptionnel(infos):
+        rid = CONFIG.get("alertrole", 0)
+        if rid:
+            content = f"<@&{rid}>"
     try:
-        await salon.send(embed=embed)
+        await salon.send(content=content, embed=embed)
     except discord.HTTPException:
         pass
 
 
 # ==============================================================================
-#  VUES INTERACTIVES
+#  VUES
 # ==============================================================================
-
-def valeur_affichee(guild, key):
-    rid = CONFIG.get(key, 0)
-    if not rid:
-        return "*non defini*"
-    if SET_ITEMS[key]["type"] == "channel":
-        ch = guild.get_channel(rid)
-        return ch.mention if ch else "*salon introuvable*"
-    role = guild.get_role(rid)
-    return role.mention if role else "*role introuvable*"
-
-
-def embed_config(guild):
-    embed = discord.Embed(title="⚙️ Configuration du bot",
-                          description="Choisis un element dans le menu, puis le role/salon a lui associer.",
-                          color=discord.Color.blurple())
-    for cat, keys in CATEGORIES.items():
-        lignes = []
-        for k in keys:
-            prefixe = emoji_de(k) + " " if k in DEFAULT_EMOJIS else ""
-            lignes.append(f"{prefixe}**{SET_ITEMS[k]['label']}** → {valeur_affichee(guild, k)}")
-        embed.add_field(name=cat, value="\n".join(lignes), inline=False)
-    embed.set_footer(text="Reglages sauvegardes dans la base de donnees")
-    return embed
-
 
 class AuthorView(discord.ui.View):
     def __init__(self, author, guild, timeout=180):
@@ -428,96 +488,136 @@ class AuthorView(discord.ui.View):
         return True
 
 
-# --- !set --------------------------------------------------------------------
+def valeur_affichee(guild, key):
+    rid = CONFIG.get(key, 0)
+    if not rid:
+        return "*non defini*"
+    if SET_ITEMS[key]["type"] == "channel":
+        ch = guild.get_channel(rid)
+        return ch.mention if ch else "*introuvable*"
+    role = guild.get_role(rid)
+    return role.mention if role else "*introuvable*"
 
-class ItemSelect(discord.ui.Select):
+
+def embed_config(guild):
+    embed = discord.Embed(title="⚙️ Configuration",
+                          description="Choisis une categorie, puis l'element a regler.",
+                          color=discord.Color.blurple())
+    for cat, keys in CATEGORIES.items():
+        lignes = []
+        for k in keys:
+            pref = emoji_de(k) + " " if k in DEFAULT_EMOJIS else ""
+            lignes.append(f"{pref}**{SET_ITEMS[k]['label']}** → {valeur_affichee(guild, k)}")
+        embed.add_field(name=cat, value="\n".join(lignes), inline=False)
+    return embed
+
+
+# --- !set : categorie -> element -> role/salon ---
+
+class SetCategorySelect(discord.ui.Select):
     def __init__(self):
-        options = []
-        for cat, keys in CATEGORIES.items():
-            for key in keys:
-                options.append(discord.SelectOption(label=SET_ITEMS[key]["label"], value=key, description=cat))
-        super().__init__(placeholder="Choisis l'element a configurer…", options=options)
+        super().__init__(placeholder="Choisis une categorie…",
+                         options=[discord.SelectOption(label=c, value=c) for c in CATEGORIES])
 
     async def callback(self, interaction):
-        await self.view.ouvrir_selection(interaction, self.values[0])
+        await interaction.response.edit_message(
+            embed=embed_config(self.view.guild),
+            view=SetItemView(self.view.author, self.view.guild, self.values[0]))
 
 
 class ConfigView(AuthorView):
     def __init__(self, author, guild):
         super().__init__(author, guild)
-        self.add_item(ItemSelect())
+        self.add_item(SetCategorySelect())
 
-    async def ouvrir_selection(self, interaction, key):
+
+class SetItemSelect(discord.ui.Select):
+    def __init__(self, cat):
+        super().__init__(placeholder=f"{cat} — choisis l'element…",
+                         options=[discord.SelectOption(label=SET_ITEMS[k]["label"], value=k)
+                                  for k in CATEGORIES[cat]])
+
+    async def callback(self, interaction):
+        key = self.values[0]
         it = SET_ITEMS[key]
         if it["type"] == "channel":
-            view = ChannelPickView(self.author, self.guild, key)
-            desc = "Choisis le salon ci-dessous (tape pour rechercher)."
+            view = ChannelPickView(self.view.author, self.view.guild, key)
+            desc = "Choisis le salon (tape pour rechercher)."
         else:
-            view = RolePickView(self.author, self.guild, key)
-            desc = "Choisis le role ci-dessous (tape pour rechercher)."
+            view = RolePickView(self.view.author, self.view.guild, key)
+            desc = "Choisis le role (tape pour rechercher)."
         embed = discord.Embed(title=f"Configurer : {it['label']}", description=desc, color=discord.Color.blurple())
         await interaction.response.edit_message(embed=embed, view=view)
 
 
-class RetourBouton(discord.ui.Button):
+class RetourConfig(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="◀ Retour a la config", style=discord.ButtonStyle.secondary)
+        super().__init__(label="◀ Retour", style=discord.ButtonStyle.secondary)
 
     async def callback(self, interaction):
         await interaction.response.edit_message(embed=embed_config(self.view.guild),
                                                 view=ConfigView(self.view.author, self.view.guild))
 
 
+class SetItemView(AuthorView):
+    def __init__(self, author, guild, cat):
+        super().__init__(author, guild)
+        self.add_item(SetItemSelect(cat))
+        self.add_item(RetourConfig())
+
+
 class RolePicker(discord.ui.RoleSelect):
     def __init__(self, key):
         self.key = key
-        super().__init__(placeholder="Recherche et choisis un role…", min_values=1, max_values=1)
+        super().__init__(placeholder="Recherche un role…", min_values=1, max_values=1)
 
     async def callback(self, interaction):
         role = self.values[0]
         definir_config(self.key, role.id)
-        embed = discord.Embed(title="✅ Effectue",
-                              description=f"**{SET_ITEMS[self.key]['label']}** est lie a {role.mention}.",
-                              color=discord.Color.green())
-        await interaction.response.edit_message(embed=embed, view=RetourView(self.view.author, self.view.guild))
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="✅ Effectue",
+                                description=f"**{SET_ITEMS[self.key]['label']}** → {role.mention}",
+                                color=discord.Color.green()),
+            view=RetourView(self.view.author, self.view.guild))
 
 
 class RolePickView(AuthorView):
     def __init__(self, author, guild, key):
         super().__init__(author, guild)
         self.add_item(RolePicker(key))
-        self.add_item(RetourBouton())
+        self.add_item(RetourConfig())
 
 
 class ChannelPicker(discord.ui.ChannelSelect):
     def __init__(self, key):
         self.key = key
-        super().__init__(placeholder="Recherche et choisis un salon…",
+        super().__init__(placeholder="Recherche un salon…",
                          channel_types=[discord.ChannelType.text], min_values=1, max_values=1)
 
     async def callback(self, interaction):
         salon = self.values[0]
         definir_config(self.key, salon.id)
-        embed = discord.Embed(title="✅ Effectue",
-                              description=f"**{SET_ITEMS[self.key]['label']}** est lie a {salon.mention}.",
-                              color=discord.Color.green())
-        await interaction.response.edit_message(embed=embed, view=RetourView(self.view.author, self.view.guild))
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="✅ Effectue",
+                                description=f"**{SET_ITEMS[self.key]['label']}** → {salon.mention}",
+                                color=discord.Color.green()),
+            view=RetourView(self.view.author, self.view.guild))
 
 
 class ChannelPickView(AuthorView):
     def __init__(self, author, guild, key):
         super().__init__(author, guild)
         self.add_item(ChannelPicker(key))
-        self.add_item(RetourBouton())
+        self.add_item(RetourConfig())
 
 
 class RetourView(AuthorView):
     def __init__(self, author, guild):
         super().__init__(author, guild)
-        self.add_item(RetourBouton())
+        self.add_item(RetourConfig())
 
 
-# --- Pagination (list + scan) ------------------------------------------------
+# --- Pagination generique (list + top) ---
 
 class PrevButton(discord.ui.Button):
     def __init__(self):
@@ -535,19 +635,18 @@ class NextButton(discord.ui.Button):
         await self.view.changer_page(interaction, +1)
 
 
-class ListView(AuthorView):
+class PageView(AuthorView):
     PAR_PAGE = 10
 
-    def __init__(self, author, guild, key, membres):
+    def __init__(self, author, guild, titre, lignes, couleur=None):
         super().__init__(author, guild)
-        self.key = key
-        self.membres = membres
+        self.titre = titre
+        self.lignes = lignes
+        self.couleur = couleur or discord.Color.blurple()
         self.page = 0
-        self.total_pages = max(1, (len(membres) + self.PAR_PAGE - 1) // self.PAR_PAGE)
-        self.prev = PrevButton()
-        self.next = NextButton()
-        self.add_item(self.prev)
-        self.add_item(self.next)
+        self.total_pages = max(1, (len(lignes) + self.PAR_PAGE - 1) // self.PAR_PAGE)
+        self.prev = PrevButton(); self.next = NextButton()
+        self.add_item(self.prev); self.add_item(self.next)
         self._maj()
 
     def _maj(self):
@@ -556,13 +655,9 @@ class ListView(AuthorView):
 
     def embed_courant(self):
         debut = self.page * self.PAR_PAGE
-        lot = self.membres[debut:debut + self.PAR_PAGE]
-        lignes = [f"{m.mention} / `{m.id}`" for m in lot]
-        embed = discord.Embed(
-            title=f"{emoji_de(self.key)} {SET_ITEMS[self.key]['label']} — {len(self.membres)} personne(s)",
-            description="\n".join(lignes) if lignes else "Personne.",
-            color=discord.Color.blurple())
-        embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages}")
+        lot = self.lignes[debut:debut + self.PAR_PAGE]
+        embed = discord.Embed(title=self.titre, description="\n".join(lot) or "Vide.", color=self.couleur)
+        embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages} — {len(self.lignes)} au total")
         return embed
 
     async def changer_page(self, interaction, delta):
@@ -571,108 +666,124 @@ class ListView(AuthorView):
         await interaction.response.edit_message(embed=self.embed_courant(), view=self)
 
 
-# --- !scan interactif --------------------------------------------------------
+# --- !scan : categorie -> element -> resultat ---
 
-class ScanSelect(discord.ui.Select):
+SCAN_CATEGORIES = {c: [k for k in keys if k in DETECT_KEYS]
+                   for c, keys in CATEGORIES.items()
+                   if any(k in DETECT_KEYS for k in keys)}
+
+
+class ScanCategorySelect(discord.ui.Select):
     def __init__(self):
-        options = []
-        for cat, keys in CATEGORIES.items():
-            for key in keys:
-                if SET_ITEMS[key]["type"] == "role":  # on ne scanne pas les salons
-                    options.append(discord.SelectOption(label=SET_ITEMS[key]["label"], value=key, description=cat))
-        super().__init__(placeholder="Choisis une categorie a scanner…", options=options)
+        super().__init__(placeholder="Choisis une categorie a scanner…",
+                         options=[discord.SelectOption(label=c, value=c) for c in SCAN_CATEGORIES])
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            embed=embed_scan_accueil(),
+            view=ScanItemView(self.view.author, self.view.guild, self.values[0]))
+
+
+class ScanItemSelect(discord.ui.Select):
+    def __init__(self, cat):
+        super().__init__(placeholder=f"{cat} — choisis le critere…",
+                         options=[discord.SelectOption(label=SET_ITEMS[k]["label"], value=k)
+                                  for k in SCAN_CATEGORIES[cat]])
 
     async def callback(self, interaction):
         key = self.values[0]
         membres = membres_avec(self.view.guild, key)
         if not membres:
             await interaction.response.edit_message(
-                embed=discord.Embed(description=f"Personne ne correspond a **{SET_ITEMS[key]['label']}**.",
+                embed=discord.Embed(description=f"Personne pour **{SET_ITEMS[key]['label']}**.",
                                     color=discord.Color.orange()),
                 view=ScanView(self.view.author, self.view.guild))
             return
-
-        liste = ListView(self.view.author, self.view.guild, key, membres)
-        scan_id = CONFIG.get("scanlog", 0)
-        salon = self.view.guild.get_channel(scan_id) if scan_id else None
-
+        lignes = [f"{m.mention} / `{m.id}`" for m in membres]
+        titre = f"{emoji_de(key)} {SET_ITEMS[key]['label']}"
+        vue_liste = PageView(self.view.author, self.view.guild, titre, lignes)
+        salon = self.view.guild.get_channel(CONFIG.get("scanlog", 0))
         if salon:
-            await salon.send(embed=liste.embed_courant(), view=liste if liste.total_pages > 1 else None)
+            await salon.send(embed=vue_liste.embed_courant(), view=vue_liste if vue_liste.total_pages > 1 else None)
             await interaction.response.edit_message(
-                embed=discord.Embed(description=f"✅ Resultat ({len(membres)}) envoye dans {salon.mention}.",
+                embed=discord.Embed(description=f"✅ {len(membres)} resultat(s) envoye(s) dans {salon.mention}.",
                                     color=discord.Color.green()),
                 view=ScanView(self.view.author, self.view.guild))
         else:
-            # Pas de salon de scan defini : on affiche directement ici.
-            await interaction.response.edit_message(embed=liste.embed_courant(),
-                                                    view=liste if liste.total_pages > 1 else None)
+            await interaction.response.edit_message(
+                embed=vue_liste.embed_courant(), view=vue_liste if vue_liste.total_pages > 1 else None)
 
 
 class ScanView(AuthorView):
     def __init__(self, author, guild):
         super().__init__(author, guild)
-        self.add_item(ScanSelect())
+        self.add_item(ScanCategorySelect())
+
+
+class ScanItemView(AuthorView):
+    def __init__(self, author, guild, cat):
+        super().__init__(author, guild)
+        self.add_item(ScanItemSelect(cat))
 
 
 def embed_scan_accueil():
-    return discord.Embed(
-        title="🔍 Scan par categorie",
-        description=("Choisis une categorie dans le menu : le bot listera tous les membres concernes.\n"
-                     "Le resultat est envoye dans le salon de scan (definis-le avec `!set` ou `!setscan`)."),
-        color=discord.Color.blurple())
+    return discord.Embed(title="🔍 Scan par categorie",
+                         description="Choisis une categorie puis un critere. Le resultat va dans le salon de scan.",
+                         color=discord.Color.blurple())
 
 
-# --- !help -------------------------------------------------------------------
+# --- !help ---
 
 HELP_CATEGORIES = {
     "🔍 Detection": [
-        ("!scan", "Menu pour lister les membres d'une categorie (vers le salon de scan)."),
-        ("!check @membre", "Profil detaille d'un membre : badges, niveau, particularites."),
-        ("!list <categorie>", "Liste les membres d'une categorie, par pages de 10."),
+        ("!scan", "Lister les membres d'un critere (vers le salon de scan)."),
+        ("!profil @membre", "Profil complet : badges, boost, niveau, points forts."),
+        ("!list <critere>", "Liste paginee des membres d'un critere."),
+        ("!recheck @membre", "Force la re-analyse d'un membre."),
+        ("!stats", "Tableau de bord global du serveur."),
+        ("!top", "Classement des comptes les plus rares."),
+        ("!bareme", "Affiche le bareme de rarete."),
     ],
     "⚙️ Configuration": [
-        ("!set", "Panneau interactif pour associer roles et salons."),
-        ("!config", "Affiche la configuration actuelle."),
-        ("!setlog #salon", "Definit le salon des logs (joins)."),
-        ("!setscan #salon", "Definit le salon des resultats de scan."),
-        ("!setemoji <cle> <emoji>", "Associe ton emoji perso a une categorie."),
-        ("!setmsg <texte>", "Personnalise le titre du message de join."),
+        ("!set", "Panneau interactif (roles, salons, alertes)."),
+        ("!config", "Affiche la configuration."),
+        ("!setlog #salon", "Salon des joins."),
+        ("!setscan #salon", "Salon des scans."),
+        ("!setemoji <cle> <emoji>", "Ton emoji perso sur un critere."),
+        ("!setmsg <texte>", "Titre du message de join."),
     ],
     "👑 Gestion": [
-        ("!owner @membre", "Ajoute un owner. **Buyer uniquement.**"),
-        ("!unowner @membre", "Retire un owner. **Buyer uniquement.**"),
-        ("!owners", "Affiche le buyer et les owners."),
+        ("!owner @membre", "Ajoute un owner (buyer)."),
+        ("!unowner @membre", "Retire un owner (buyer)."),
+        ("!owners", "Buyer + owners."),
     ],
 }
 
 
 def embed_help_accueil():
-    embed = discord.Embed(title="📖 Aide du bot",
-                          description="Detecte les comptes rares et leur attribue des roles.\n\n"
-                                      "Choisis une categorie dans le menu deroulant ci-dessous.",
-                          color=discord.Color.blurple())
-    embed.add_field(name="Categories", value="\n".join(f"• {c}" for c in HELP_CATEGORIES), inline=False)
-    embed.set_footer(text="Les commandes de gestion sont reservees au buyer / aux owners.")
-    return embed
+    e = discord.Embed(title="📖 Aide du bot",
+                      description="Detecte les comptes rares et attribue des roles.\nChoisis une categorie ci-dessous.",
+                      color=discord.Color.blurple())
+    e.add_field(name="Categories", value="\n".join(f"• {c}" for c in HELP_CATEGORIES), inline=False)
+    return e
 
 
 def embed_help_categorie(cat):
-    embed = discord.Embed(title=f"📖 Aide — {cat}", color=discord.Color.blurple())
+    e = discord.Embed(title=f"📖 Aide — {cat}", color=discord.Color.blurple())
     for nom, desc in HELP_CATEGORIES[cat]:
-        embed.add_field(name=nom, value=desc, inline=False)
-    return embed
+        e.add_field(name=nom, value=desc, inline=False)
+    return e
 
 
 class HelpSelect(discord.ui.Select):
     def __init__(self):
-        options = [discord.SelectOption(label="Accueil", value="accueil", emoji="🏠")]
-        for cat in HELP_CATEGORIES:
-            options.append(discord.SelectOption(label=cat, value=cat))
-        super().__init__(placeholder="Choisis une categorie…", options=options)
+        opts = [discord.SelectOption(label="Accueil", value="accueil", emoji="🏠")]
+        opts += [discord.SelectOption(label=c, value=c) for c in HELP_CATEGORIES]
+        super().__init__(placeholder="Choisis une categorie…", options=opts)
 
     async def callback(self, interaction):
-        choix = self.values[0]
-        embed = embed_help_accueil() if choix == "accueil" else embed_help_categorie(choix)
+        v = self.values[0]
+        embed = embed_help_accueil() if v == "accueil" else embed_help_categorie(v)
         await interaction.response.edit_message(embed=embed, view=self.view)
 
 
@@ -703,9 +814,7 @@ async def afficher_config(ctx):
 async def setlog(ctx, salon: discord.TextChannel = None):
     salon = salon or ctx.channel
     definir_config("logs", salon.id)
-    await ctx.send(embed=discord.Embed(title="✅ Salon de logs (joins) defini",
-                                       description=f"Les joins rares seront annonces dans {salon.mention}.",
-                                       color=discord.Color.green()))
+    await ctx.send(f"✅ Salon de logs (joins) : {salon.mention}")
 
 
 @bot.command(name="setscan")
@@ -713,34 +822,33 @@ async def setlog(ctx, salon: discord.TextChannel = None):
 async def setscan(ctx, salon: discord.TextChannel = None):
     salon = salon or ctx.channel
     definir_config("scanlog", salon.id)
-    await ctx.send(embed=discord.Embed(title="✅ Salon de scan defini",
-                                       description=f"Les resultats de scan seront envoyes dans {salon.mention}.",
-                                       color=discord.Color.green()))
+    await ctx.send(f"✅ Salon de scan : {salon.mention}")
+
+
+@bot.command(name="setalert")
+@check_owner()
+async def setalert(ctx, role: discord.Role):
+    definir_config("alertrole", role.id)
+    await ctx.send(f"✅ Role ping lors d'un compte exceptionnel : {role.mention}")
 
 
 @bot.command(name="setemoji")
 @check_owner()
 async def setemoji(ctx, cle: str = None, emoji: str = None):
     if cle not in DEFAULT_EMOJIS or emoji is None:
-        dispo = ", ".join(f"`{k}`" for k in DEFAULT_EMOJIS)
-        await ctx.send(f"Utilisation : `!setemoji <cle> <emoji>`\nCles : {dispo}")
+        await ctx.send(f"Utilisation : `!setemoji <cle> <emoji>`\nCles : {', '.join(f'`{k}`' for k in DEFAULT_EMOJIS)}")
         return
     definir_emoji(cle, emoji)
-    await ctx.send(embed=discord.Embed(title="✅ Emoji defini",
-                                       description=f"**{SET_ITEMS[cle]['label']}** utilise maintenant {emoji}.",
-                                       color=discord.Color.green()))
+    await ctx.send(f"✅ **{SET_ITEMS[cle]['label']}** utilise maintenant {emoji}.")
 
 
 @bot.command(name="setmsg")
 @check_owner()
 async def setmsg(ctx, *, texte: str = None):
     if not texte:
-        await ctx.send("Utilisation : `!setmsg <texte>` (titre du message de join).")
-        return
+        await ctx.send("Utilisation : `!setmsg <texte>`"); return
     definir_message("join", texte)
-    await ctx.send(embed=discord.Embed(title="✅ Message de join mis a jour",
-                                       description=f"Nouveau titre : {texte}",
-                                       color=discord.Color.green()))
+    await ctx.send(f"✅ Titre de join : {texte}")
 
 
 @bot.command(name="scan")
@@ -749,17 +857,22 @@ async def scan(ctx):
     await ctx.send(embed=embed_scan_accueil(), view=ScanView(ctx.author, ctx.guild))
 
 
-@bot.command(name="check")
+@bot.command(name="profil", aliases=["check"])
 @check_owner()
-async def check(ctx, member: discord.Member = None):
+async def profil(ctx, member: discord.Member = None):
     member = member or ctx.author
-    infos = {
-        "badges": detecter_badges(member),
-        "pseudo": detecter_pseudo(member),
-        "anciennete": detecter_anciennete(member),
-        "erreurs": [],
-    }
-    embed = embed_profil(member, infos, f"🔎 Analyse de {member.name}")
+    infos = collecter_infos(member)
+    embed = embed_profil(member, infos, f"🔎 Profil de {member.name}")
+    await ajouter_banniere(embed, member)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="recheck")
+@check_owner()
+async def recheck(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    infos = await appliquer_roles(member)
+    embed = embed_profil(member, infos, f"🔁 Re-verification de {member.name}")
     await ajouter_banniere(embed, member)
     await ctx.send(embed=embed)
 
@@ -768,31 +881,100 @@ async def check(ctx, member: discord.Member = None):
 @check_owner()
 async def list_cmd(ctx, cle: str = None):
     if cle not in DETECT_KEYS:
-        dispo = ", ".join(f"`{k}`" for k in DETECT_KEYS)
-        await ctx.send(f"Utilisation : `!list <categorie>`\nCategories : {dispo}")
+        await ctx.send(f"Utilisation : `!list <critere>`\nCriteres : {', '.join(f'`{k}`' for k in DETECT_KEYS)}")
         return
     membres = membres_avec(ctx.guild, cle)
     if not membres:
-        await ctx.send(f"Personne ne correspond a **{SET_ITEMS[cle]['label']}**.")
-        return
-    view = ListView(ctx.author, ctx.guild, cle, membres)
-    if view.total_pages == 1:
-        await ctx.send(embed=view.embed_courant())
-    else:
-        await ctx.send(embed=view.embed_courant(), view=view)
+        await ctx.send(f"Personne pour **{SET_ITEMS[cle]['label']}**."); return
+    lignes = [f"{m.mention} / `{m.id}`" for m in membres]
+    view = PageView(ctx.author, ctx.guild, f"{emoji_de(cle)} {SET_ITEMS[cle]['label']}", lignes)
+    await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
+
+
+@bot.command(name="top")
+@check_owner()
+async def top(ctx):
+    classement = []
+    for m in ctx.guild.members:
+        if m.bot:
+            continue
+        infos = collecter_infos(m)
+        s, niv, _ = niveau_rarete(infos)
+        if s > 0:
+            classement.append((s, niv, m))
+    classement.sort(key=lambda x: x[0], reverse=True)
+    if not classement:
+        await ctx.send("Aucun compte rare trouve."); return
+    lignes = [f"**{i}.** {m.mention} — {niv} ({s} pts)" for i, (s, niv, m) in enumerate(classement, 1)]
+    view = PageView(ctx.author, ctx.guild, "🏆 Classement des comptes rares", lignes, discord.Color.gold())
+    await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
+
+
+@bot.command(name="stats")
+@check_owner()
+async def stats(ctx):
+    compteur = {k: 0 for k in DETECT_KEYS}
+    niveaux_count = {n: 0 for _, n, _ in NIVEAUX}
+    total_rares = 0
+    membres = [m for m in ctx.guild.members if not m.bot]
+    for m in membres:
+        infos = collecter_infos(m)
+        if est_notable(infos):
+            total_rares += 1
+        for b in infos["badges"]:
+            compteur[b] += 1
+        for p in infos["pseudo"]:
+            compteur[p] += 1
+        for extra in (infos["anciennete"], infos["boost"]):
+            if extra:
+                compteur[extra] += 1
+        if infos["nitro"]:
+            compteur["nitro"] += 1
+        _, niv, _ = niveau_rarete(infos)
+        niveaux_count[niv] += 1
+
+    embed = discord.Embed(title="📊 Statistiques du serveur", color=discord.Color.blurple())
+    embed.add_field(name="Vue d'ensemble",
+                    value=f"{len(membres)} membres · **{total_rares}** comptes notables", inline=False)
+    embed.add_field(name="Niveaux",
+                    value="\n".join(f"{n} : {niveaux_count[n]}" for _, n, _ in NIVEAUX), inline=True)
+    badges_txt = "\n".join(f"{emoji_de(k)} {SET_ITEMS[k]['label']} : {compteur[k]}"
+                           for k in CATEGORIES["🏅 Badges"] if compteur[k]) or "—"
+    embed.add_field(name="Badges", value=badges_txt, inline=True)
+    autres = []
+    for cat in ("💎 Nitro & Boost", "📅 Anciennete", "✨ Pseudo"):
+        for k in CATEGORIES[cat]:
+            if k in compteur and compteur[k]:
+                autres.append(f"{emoji_de(k)} {SET_ITEMS[k]['label']} : {compteur[k]}")
+    embed.add_field(name="Autres criteres", value="\n".join(autres) or "—", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="bareme")
+@check_owner()
+async def bareme(ctx):
+    embed = discord.Embed(title="📐 Bareme de rarete",
+                          description="Chaque critere rapporte des points. Le total donne le niveau.",
+                          color=discord.Color.blurple())
+    def bloc(keys):
+        return "\n".join(f"{SET_ITEMS[k]['label']} : **{POIDS[k]}**" for k in keys if k in POIDS)
+    embed.add_field(name="🏅 Badges", value=bloc(CATEGORIES["🏅 Badges"]), inline=True)
+    embed.add_field(name="📅 / ✨", value=bloc(CATEGORIES["📅 Anciennete"] + CATEGORIES["✨ Pseudo"]), inline=True)
+    embed.add_field(name="💎 Nitro & Boost", value=bloc(CATEGORIES["💎 Nitro & Boost"]), inline=True)
+    embed.add_field(name="Niveaux (score minimum)",
+                    value="\n".join(f"{n} : {s}+ pts" for s, n, _ in NIVEAUX), inline=False)
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="owner")
 @check_buyer()
 async def owner_cmd(ctx, membre: discord.User):
     if membre.id == BUYER_ID:
-        await ctx.send("Tu es le buyer : tu as deja tous les droits."); return
+        await ctx.send("Tu es le buyer."); return
     if membre.id in OWNERS:
         await ctx.send(f"{membre.mention} est deja owner."); return
     ajouter_owner(membre.id)
-    await ctx.send(embed=discord.Embed(title="✅ Owner ajoute",
-                                       description=f"{membre.mention} (`{membre.id}`) est maintenant owner.",
-                                       color=discord.Color.green()))
+    await ctx.send(f"✅ {membre.mention} (`{membre.id}`) est owner.")
 
 
 @bot.command(name="unowner")
@@ -803,17 +985,14 @@ async def unowner_cmd(ctx, membre: discord.User):
     if membre.id not in OWNERS:
         await ctx.send(f"{membre.mention} n'est pas owner."); return
     retirer_owner(membre.id)
-    await ctx.send(embed=discord.Embed(title="✅ Owner retire",
-                                       description=f"{membre.mention} n'est plus owner.",
-                                       color=discord.Color.orange()))
+    await ctx.send(f"✅ {membre.mention} n'est plus owner.")
 
 
 @bot.command(name="owners")
 @check_owner()
 async def owners_cmd(ctx):
-    lignes = [f"👑 <@{BUYER_ID}> — **Buyer**"]
-    lignes += [f"• <@{uid}>" for uid in OWNERS] or ["*(aucun owner)*"]
-    await ctx.send(embed=discord.Embed(title="Hierarchie du bot", description="\n".join(lignes),
+    lignes = [f"👑 <@{BUYER_ID}> — **Buyer**"] + ([f"• <@{u}>" for u in OWNERS] or ["*(aucun owner)*"])
+    await ctx.send(embed=discord.Embed(title="Hierarchie", description="\n".join(lignes),
                                        color=discord.Color.blurple()))
 
 
@@ -829,12 +1008,12 @@ async def help_cmd(ctx):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CheckFailure):
-        await ctx.send("⛔ Tu n'as pas l'autorisation d'utiliser cette commande.")
+        await ctx.send("⛔ Tu n'as pas l'autorisation.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Argument manquant. Ex : `!owner @membre`.")
+        await ctx.send("Argument manquant.")
     elif isinstance(error, (commands.UserNotFound, commands.MemberNotFound,
-                            commands.ChannelNotFound, commands.BadArgument)):
-        await ctx.send("Argument invalide (utilisateur/salon introuvable).")
+                            commands.ChannelNotFound, commands.RoleNotFound, commands.BadArgument)):
+        await ctx.send("Argument invalide.")
     elif isinstance(error, commands.CommandNotFound):
         return
     else:
@@ -843,9 +1022,9 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_ready():
-    print(f"Bot connecte en tant que {bot.user} (id {bot.user.id})")
+    print(f"Bot connecte : {bot.user} (id {bot.user.id})")
     if not WORDFREQ_OK:
-        print("/!\\ wordfreq non installe : la detection des vrais mots est desactivee.")
+        print("/!\\ wordfreq non installe : detection des mots desactivee.")
     print(f"Buyer : {BUYER_ID} | Owners : {len(OWNERS)}")
 
 
@@ -854,8 +1033,24 @@ async def on_member_join(member):
     if member.bot:
         return
     infos = await appliquer_roles(member)
-    if infos["badges"] or infos["pseudo"] or infos["anciennete"]:
+    if est_notable(infos):
         await envoyer_log_join(member.guild, member, infos)
+
+
+@bot.event
+async def on_member_update(before, after):
+    # Re-detection auto (ex: changement de boost).
+    if not after.bot:
+        await appliquer_roles(after)
+
+
+@bot.event
+async def on_user_update(before, after):
+    # Re-detection auto (ex: changement de pseudo) sur tous les serveurs partages.
+    for g in bot.guilds:
+        m = g.get_member(after.id)
+        if m and not m.bot:
+            await appliquer_roles(m)
 
 
 if __name__ == "__main__":
