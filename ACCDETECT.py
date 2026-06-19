@@ -35,7 +35,7 @@ from discord.ext import commands
 
 # >>> REMPLACE ce nombre par TON identifiant Discord. Toi seul es le buyer. <<<
 # (Mode developpeur active > clic droit sur ton profil > Copier l'identifiant)
-BUYER_ID = 142365250803466240
+BUYER_ID = 123456789012345678
 
 # Token : laisse-le dans la variable d'environnement DISCORD_TOKEN (recommande,
 # surtout si tu mets le code sur GitHub : ne JAMAIS commit ton token).
@@ -184,7 +184,8 @@ def check_owner():
 # ==============================================================================
 
 intents = discord.Intents.default()
-intents.members = True
+intents.members = True          # OBLIGATOIRE (Server Members Intent)
+intents.message_content = True  # OBLIGATOIRE pour lire les commandes en "!" (Message Content Intent)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -230,6 +231,27 @@ def detecter_pseudo(user: discord.User) -> list[str]:
     if nom.isdigit():
         out.append("chiffres")
     return out
+
+
+# Seuils d'anciennete sous forme de dictionnaire { "og2016": datetime, ... }
+OG_THRESHOLDS = dict(OG_SEUILS)
+
+# Cles utilisables avec !list (tout sauf le salon de logs).
+DETECT_KEYS = [k for k in SET_ITEMS if k != "logs"]
+
+
+def membre_a_cle(member: discord.Member, key: str) -> bool:
+    """Dit si un membre correspond a une categorie donnee.
+    Pour l'anciennete, c'est cumulatif : og2018 = tout compte cree avant 2018."""
+    if key in OG_THRESHOLDS:
+        return member.created_at < OG_THRESHOLDS[key]
+    if key in ("pseudo2", "pseudo3", "lettres", "chiffres"):
+        return key in detecter_pseudo(member)
+    return key in detecter_badges(member)
+
+
+def membres_avec(guild: discord.Guild, key: str) -> list[discord.Member]:
+    return [m for m in guild.members if not m.bot and membre_a_cle(m, key)]
 
 
 async def appliquer_roles(member: discord.Member) -> dict:
@@ -466,6 +488,61 @@ class RetourView(AuthorView):
         self.add_item(RetourBouton())
 
 
+# --- Pagination pour !list ---------------------------------------------------
+
+class PrevButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="◀ Precedent", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.changer_page(interaction, -1)
+
+
+class NextButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Suivant ▶", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.changer_page(interaction, +1)
+
+
+class ListView(AuthorView):
+    PAR_PAGE = 10
+
+    def __init__(self, author, guild, key, membres):
+        super().__init__(author, guild)
+        self.key = key
+        self.membres = membres
+        self.page = 0
+        self.total_pages = max(1, (len(membres) + self.PAR_PAGE - 1) // self.PAR_PAGE)
+        self.prev = PrevButton()
+        self.next = NextButton()
+        self.add_item(self.prev)
+        self.add_item(self.next)
+        self._maj_boutons()
+
+    def _maj_boutons(self):
+        self.prev.disabled = self.page == 0
+        self.next.disabled = self.page >= self.total_pages - 1
+
+    def embed_courant(self) -> discord.Embed:
+        debut = self.page * self.PAR_PAGE
+        lot = self.membres[debut:debut + self.PAR_PAGE]
+        lignes = [f"{m.mention} / `{m.id}`" for m in lot]
+        embed = discord.Embed(
+            title=f"{SET_ITEMS[self.key]['label']} — {len(self.membres)} personne(s)",
+            description="\n".join(lignes) if lignes else "Personne.",
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"Page {self.page + 1}/{self.total_pages}")
+        return embed
+
+    async def changer_page(self, interaction: discord.Interaction, delta: int):
+        self.page = max(0, min(self.total_pages - 1, self.page + delta))
+        self._maj_boutons()
+        await interaction.response.edit_message(embed=self.embed_courant(), view=self)
+
+
 # ==============================================================================
 #  COMMANDES - CONFIGURATION (owners)
 # ==============================================================================
@@ -512,6 +589,41 @@ async def check(ctx: commands.Context, member: discord.Member = None):
     embed.add_field(name="Badges", value=", ".join(SET_ITEMS[b]["label"] for b in badges) or "aucun", inline=False)
     embed.add_field(name="Pseudo", value=", ".join(SET_ITEMS[p]["label"] for p in pseudo) or "rien", inline=False)
     await ctx.send(embed=embed)
+
+
+@bot.command(name="setlog")
+@check_owner()
+async def setlog(ctx: commands.Context, salon: discord.TextChannel = None):
+    """Definit le salon de logs. Ex: !setlog #salon  (ou !setlog dans le salon voulu)."""
+    salon = salon or ctx.channel
+    definir_config("logs", salon.id)
+    embed = discord.Embed(
+        title="✅ Salon de logs defini",
+        description=f"Les comptes rares seront annonces dans {salon.mention}.",
+        color=discord.Color.green(),
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="list")
+@check_owner()
+async def list_cmd(ctx: commands.Context, cle: str = None):
+    """Liste les membres d'une categorie, par pages de 10. Ex: !list early"""
+    if cle not in DETECT_KEYS:
+        dispo = ", ".join(f"`{k}`" for k in DETECT_KEYS)
+        await ctx.send(f"Utilisation : `!list <categorie>`\nCategories possibles : {dispo}")
+        return
+
+    membres = membres_avec(ctx.guild, cle)
+    if not membres:
+        await ctx.send(f"Personne ne correspond a **{SET_ITEMS[cle]['label']}**.")
+        return
+
+    view = ListView(ctx.author, ctx.guild, cle, membres)
+    if view.total_pages == 1:
+        await ctx.send(embed=view.embed_courant())  # une seule page : pas besoin de boutons
+    else:
+        await ctx.send(embed=view.embed_courant(), view=view)
 
 
 # ==============================================================================
