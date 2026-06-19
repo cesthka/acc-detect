@@ -418,26 +418,16 @@ def embed_profil(member, infos, titre):
                     inline=True)
     if member.joined_at:
         embed.add_field(name="📥 A rejoint", value=f"<t:{int(member.joined_at.timestamp())}:R>", inline=True)
-    embed.add_field(name="💠 Nitro probable", value="Oui" if infos["nitro"] else "Non", inline=True)
 
-    # Badges
-    liste = "\n".join(f"{emoji_de(b)} {SET_ITEMS[b]['label']}" for b in infos["badges"]) or "Aucun badge rare"
-    embed.add_field(name="🏅 Badges", value=liste, inline=False)
-
-    # Particularites (pseudo + anciennete + boost)
-    parts = list(infos["pseudo"])
+    # Badges = emojis seuls (badges + pseudo + anciennete + boost + nitro), sans texte.
+    cles = list(infos["badges"]) + list(infos["pseudo"])
     for extra in (infos["anciennete"], infos["boost"]):
         if extra:
-            parts.append(extra)
-    if parts:
-        details = ", ".join(f"{emoji_de(k)} {SET_ITEMS[k]['label']}" for k in parts)
-        embed.add_field(name="✨ Particularites", value=details, inline=False)
-
-    # Mini-categorie "points forts" : les elements les plus rares
-    forts = [k for k in (list(infos["badges"]) + parts) if POIDS.get(k, 0) >= 3]
-    if forts:
-        embed.add_field(name="⭐ Points forts",
-                        value=", ".join(SET_ITEMS[k]["label"] for k in forts), inline=False)
+            cles.append(extra)
+    if infos["nitro"]:
+        cles.append("nitro")
+    ligne = "  ".join(emoji_de(k) for k in cles) if cles else "—"
+    embed.add_field(name="🏅 Badges", value=ligne, inline=False)
 
     if infos["erreurs"]:
         embed.add_field(name="⚠️ Attention", value="\n".join(infos["erreurs"]), inline=False)
@@ -512,6 +502,26 @@ def embed_config(guild):
     return embed
 
 
+def embed_config_accueil():
+    e = discord.Embed(title="⚙️ Configuration",
+                      description="Choisis la categorie a configurer dans le menu ci-dessous.",
+                      color=discord.Color.blurple())
+    e.add_field(name="Categories", value="\n".join(f"• {c}" for c in CATEGORIES), inline=False)
+    return e
+
+
+def embed_config_cat(guild, cat):
+    e = discord.Embed(title=f"⚙️ {cat}",
+                      description="Choisis l'element a definir ci-dessous.",
+                      color=discord.Color.blurple())
+    lignes = []
+    for k in CATEGORIES[cat]:
+        pref = emoji_de(k) + " " if k in DEFAULT_EMOJIS else ""
+        lignes.append(f"{pref}**{SET_ITEMS[k]['label']}** → {valeur_affichee(guild, k)}")
+    e.add_field(name="Etat actuel", value="\n".join(lignes), inline=False)
+    return e
+
+
 # --- !set : categorie -> element -> role/salon ---
 
 class SetCategorySelect(discord.ui.Select):
@@ -521,7 +531,7 @@ class SetCategorySelect(discord.ui.Select):
 
     async def callback(self, interaction):
         await interaction.response.edit_message(
-            embed=embed_config(self.view.guild),
+            embed=embed_config_cat(self.view.guild, self.values[0]),
             view=SetItemView(self.view.author, self.view.guild, self.values[0]))
 
 
@@ -555,7 +565,7 @@ class RetourConfig(discord.ui.Button):
         super().__init__(label="◀ Retour", style=discord.ButtonStyle.secondary)
 
     async def callback(self, interaction):
-        await interaction.response.edit_message(embed=embed_config(self.view.guild),
+        await interaction.response.edit_message(embed=embed_config_accueil(),
                                                 view=ConfigView(self.view.author, self.view.guild))
 
 
@@ -737,12 +747,11 @@ def embed_scan_accueil():
 HELP_CATEGORIES = {
     "🔍 Detection": [
         ("!scan", "Lister les membres d'un critere (vers le salon de scan)."),
-        ("!profil @membre", "Profil complet : badges, boost, niveau, points forts."),
-        ("!list <critere>", "Liste paginee des membres d'un critere."),
-        ("!recheck @membre", "Force la re-analyse d'un membre."),
+        ("!profil @membre", "Profil complet d'un membre."),
+        ("!list", "Liste des membres d'un critere (menu deroulant)."),
         ("!stats", "Tableau de bord global du serveur."),
         ("!top", "Classement des comptes les plus rares."),
-        ("!bareme", "Affiche le bareme de rarete."),
+        ("!bareme", "Bareme de rarete (menu par categorie)."),
     ],
     "⚙️ Configuration": [
         ("!set", "Panneau interactif (roles, salons, alertes)."),
@@ -793,6 +802,96 @@ class HelpView(AuthorView):
         self.add_item(HelpSelect())
 
 
+# --- !list : categorie -> critere -> liste paginee ---
+
+def embed_list_accueil():
+    return discord.Embed(title="📋 Liste par critere",
+                         description="Choisis une categorie puis un critere pour lister les membres.",
+                         color=discord.Color.blurple())
+
+
+class ListCategorySelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="Choisis une categorie…",
+                         options=[discord.SelectOption(label=c, value=c) for c in SCAN_CATEGORIES])
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            embed=embed_list_accueil(),
+            view=ListItemView(self.view.author, self.view.guild, self.values[0]))
+
+
+class ListItemSelect(discord.ui.Select):
+    def __init__(self, cat):
+        super().__init__(placeholder=f"{cat} — choisis le critere…",
+                         options=[discord.SelectOption(label=SET_ITEMS[k]["label"], value=k)
+                                  for k in SCAN_CATEGORIES[cat]])
+
+    async def callback(self, interaction):
+        key = self.values[0]
+        membres = membres_avec(self.view.guild, key)
+        if not membres:
+            await interaction.response.edit_message(
+                embed=discord.Embed(description=f"Personne pour **{SET_ITEMS[key]['label']}**.",
+                                    color=discord.Color.orange()),
+                view=ListRootView(self.view.author, self.view.guild))
+            return
+        lignes = [f"{m.mention} / `{m.id}`" for m in membres]
+        vue = PageView(self.view.author, self.view.guild, f"{emoji_de(key)} {SET_ITEMS[key]['label']}", lignes)
+        await interaction.response.edit_message(embed=vue.embed_courant(),
+                                                view=vue if vue.total_pages > 1 else None)
+
+
+class ListRootView(AuthorView):
+    def __init__(self, author, guild):
+        super().__init__(author, guild)
+        self.add_item(ListCategorySelect())
+
+
+class ListItemView(AuthorView):
+    def __init__(self, author, guild, cat):
+        super().__init__(author, guild)
+        self.add_item(ListItemSelect(cat))
+
+
+# --- !bareme : par categorie ---
+
+BAREME_CATS = ["🏅 Badges", "💎 Nitro & Boost", "📅 Anciennete", "✨ Pseudo"]
+
+
+def embed_bareme_accueil():
+    e = discord.Embed(title="📐 Bareme de rarete",
+                      description="Choisis une categorie pour voir les points.",
+                      color=discord.Color.blurple())
+    e.add_field(name="Niveaux (score minimum)",
+                value="\n".join(f"{n} : {s}+ pts" for s, n, _ in NIVEAUX), inline=False)
+    return e
+
+
+def embed_bareme_cat(cat):
+    lignes = [f"{SET_ITEMS[k]['label']} : **{POIDS[k]}**" for k in CATEGORIES[cat] if k in POIDS]
+    return discord.Embed(title=f"📐 Bareme — {cat}", description="\n".join(lignes),
+                         color=discord.Color.blurple())
+
+
+class BaremeSelect(discord.ui.Select):
+    def __init__(self):
+        opts = [discord.SelectOption(label="Accueil (niveaux)", value="accueil", emoji="🏠")]
+        opts += [discord.SelectOption(label=c, value=c) for c in BAREME_CATS]
+        super().__init__(placeholder="Choisis une categorie…", options=opts)
+
+    async def callback(self, interaction):
+        v = self.values[0]
+        embed = embed_bareme_accueil() if v == "accueil" else embed_bareme_cat(v)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class BaremeView(AuthorView):
+    def __init__(self, author, guild):
+        super().__init__(author, guild)
+        self.add_item(BaremeSelect())
+
+
 # ==============================================================================
 #  COMMANDES
 # ==============================================================================
@@ -800,7 +899,7 @@ class HelpView(AuthorView):
 @bot.command(name="set")
 @check_owner()
 async def set_config(ctx):
-    await ctx.send(embed=embed_config(ctx.guild), view=ConfigView(ctx.author, ctx.guild))
+    await ctx.send(embed=embed_config_accueil(), view=ConfigView(ctx.author, ctx.guild))
 
 
 @bot.command(name="config")
@@ -867,28 +966,10 @@ async def profil(ctx, member: discord.Member = None):
     await ctx.send(embed=embed)
 
 
-@bot.command(name="recheck")
-@check_owner()
-async def recheck(ctx, member: discord.Member = None):
-    member = member or ctx.author
-    infos = await appliquer_roles(member)
-    embed = embed_profil(member, infos, f"🔁 Re-verification de {member.name}")
-    await ajouter_banniere(embed, member)
-    await ctx.send(embed=embed)
-
-
 @bot.command(name="list")
 @check_owner()
-async def list_cmd(ctx, cle: str = None):
-    if cle not in DETECT_KEYS:
-        await ctx.send(f"Utilisation : `!list <critere>`\nCriteres : {', '.join(f'`{k}`' for k in DETECT_KEYS)}")
-        return
-    membres = membres_avec(ctx.guild, cle)
-    if not membres:
-        await ctx.send(f"Personne pour **{SET_ITEMS[cle]['label']}**."); return
-    lignes = [f"{m.mention} / `{m.id}`" for m in membres]
-    view = PageView(ctx.author, ctx.guild, f"{emoji_de(cle)} {SET_ITEMS[cle]['label']}", lignes)
-    await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
+async def list_cmd(ctx):
+    await ctx.send(embed=embed_list_accueil(), view=ListRootView(ctx.author, ctx.guild))
 
 
 @bot.command(name="top")
@@ -953,17 +1034,7 @@ async def stats(ctx):
 @bot.command(name="bareme")
 @check_owner()
 async def bareme(ctx):
-    embed = discord.Embed(title="📐 Bareme de rarete",
-                          description="Chaque critere rapporte des points. Le total donne le niveau.",
-                          color=discord.Color.blurple())
-    def bloc(keys):
-        return "\n".join(f"{SET_ITEMS[k]['label']} : **{POIDS[k]}**" for k in keys if k in POIDS)
-    embed.add_field(name="🏅 Badges", value=bloc(CATEGORIES["🏅 Badges"]), inline=True)
-    embed.add_field(name="📅 / ✨", value=bloc(CATEGORIES["📅 Anciennete"] + CATEGORIES["✨ Pseudo"]), inline=True)
-    embed.add_field(name="💎 Nitro & Boost", value=bloc(CATEGORIES["💎 Nitro & Boost"]), inline=True)
-    embed.add_field(name="Niveaux (score minimum)",
-                    value="\n".join(f"{n} : {s}+ pts" for s, n, _ in NIVEAUX), inline=False)
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed_bareme_accueil(), view=BaremeView(ctx.author, ctx.guild))
 
 
 @bot.command(name="owner")
