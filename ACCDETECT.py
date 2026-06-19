@@ -1,28 +1,3 @@
-"""
-================================================================================
-  BOT DISCORD - DETECTION DE COMPTES RARES
-  + systeme !set interactif  + systeme buyer/owner  + base SQLite persistante
-================================================================================
-- Detecte les comptes rares (badges, anciennete, pseudos rares) et attribue des
-  roles automatiquement.
-- Se configure depuis Discord avec !set (menu deroulant + selecteur de role).
-- Hierarchie : 1 BUYER (toi, en dur dans le code, immuable) > des OWNERS (ajoutes
-  par le buyer uniquement) > tout le monde.
-- Toutes les donnees (config + owners) sont stockees dans une base SQLite, afin
-  de survivre aux redeploiements (notamment sur Railway via un Volume).
-
-------------------------------------------------------------------------------
-  A FAIRE AVANT DE LANCER :
-    1. Remplace BUYER_ID ci-dessous par TON identifiant Discord.
-    2. pip install -U discord.py        (2.1 minimum, pour RoleSelect)
-    3. Active "SERVER MEMBERS INTENT" dans le portail developpeur.
-    4. Fournis le token via la variable d'environnement DISCORD_TOKEN.
-    5. (Hosting Railway) cree un Volume, monte-le sur /data, et mets la variable
-       d'environnement DB_PATH = /data/bot.db  (voir le README).
-    6. python bot_comptes_rares.py
-================================================================================
-"""
-
 import os
 import datetime
 import sqlite3
@@ -35,7 +10,7 @@ from discord.ext import commands
 
 # >>> REMPLACE ce nombre par TON identifiant Discord. Toi seul es le buyer. <<<
 # (Mode developpeur active > clic droit sur ton profil > Copier l'identifiant)
-BUYER_ID = 123456789012345678
+BUYER_ID = 142365250803466240
 
 # Token : laisse-le dans la variable d'environnement DISCORD_TOKEN (recommande,
 # surtout si tu mets le code sur GitHub : ne JAMAIS commit ton token).
@@ -187,7 +162,7 @@ intents = discord.Intents.default()
 intents.members = True          # OBLIGATOIRE (Server Members Intent)
 intents.message_content = True  # OBLIGATOIRE pour lire les commandes en "!" (Message Content Intent)
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
 # ==============================================================================
@@ -543,6 +518,70 @@ class ListView(AuthorView):
         await interaction.response.edit_message(embed=self.embed_courant(), view=self)
 
 
+# --- Menu d'aide personnalise (!help) ----------------------------------------
+
+HELP_CATEGORIES = {
+    "🔍 Detection": [
+        ("!scan", "Analyse tous les membres presents et attribue les roles."),
+        ("!check @membre", "Montre les badges et le pseudo d'un membre, sans rien attribuer."),
+        ("!list <categorie>", "Liste les membres d'une categorie, par pages de 10."),
+    ],
+    "⚙️ Configuration": [
+        ("!set", "Panneau interactif pour associer un role a chaque element."),
+        ("!config", "Affiche la configuration actuelle."),
+        ("!setlog #salon", "Definit le salon ou sont envoyes les logs."),
+    ],
+    "👑 Gestion": [
+        ("!owner @membre", "Ajoute un owner. **Buyer uniquement.**"),
+        ("!unowner @membre", "Retire un owner. **Buyer uniquement.**"),
+        ("!owners", "Affiche le buyer et la liste des owners."),
+    ],
+    "ℹ️ Infos": [
+        ("!help", "Affiche ce menu d'aide."),
+    ],
+}
+
+
+def embed_help_accueil() -> discord.Embed:
+    embed = discord.Embed(
+        title="📖 Aide du bot",
+        description=("Ce bot detecte les comptes rares (badges, anciennete, pseudos rares) "
+                     "et leur attribue des roles automatiquement.\n\n"
+                     "Choisis une categorie dans le menu deroulant ci-dessous pour voir ses commandes."),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Categories disponibles",
+                    value="\n".join(f"• {c}" for c in HELP_CATEGORIES), inline=False)
+    embed.set_footer(text="Les commandes de gestion sont reservees au buyer / aux owners.")
+    return embed
+
+
+def embed_help_categorie(cat: str) -> discord.Embed:
+    embed = discord.Embed(title=f"📖 Aide — {cat}", color=discord.Color.blurple())
+    for nom, desc in HELP_CATEGORIES[cat]:
+        embed.add_field(name=nom, value=desc, inline=False)
+    return embed
+
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label="Accueil", value="accueil", emoji="🏠")]
+        for cat in HELP_CATEGORIES:
+            options.append(discord.SelectOption(label=cat, value=cat))
+        super().__init__(placeholder="Choisis une categorie…", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        choix = self.values[0]
+        embed = embed_help_accueil() if choix == "accueil" else embed_help_categorie(choix)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class HelpView(AuthorView):
+    def __init__(self, author, guild):
+        super().__init__(author, guild)
+        self.add_item(HelpSelect())
+
+
 # ==============================================================================
 #  COMMANDES - CONFIGURATION (owners)
 # ==============================================================================
@@ -624,6 +663,12 @@ async def list_cmd(ctx: commands.Context, cle: str = None):
         await ctx.send(embed=view.embed_courant())  # une seule page : pas besoin de boutons
     else:
         await ctx.send(embed=view.embed_courant(), view=view)
+
+
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    """Affiche le menu d'aide avec un menu deroulant pour changer de categorie."""
+    await ctx.send(embed=embed_help_accueil(), view=HelpView(ctx.author, ctx.guild))
 
 
 # ==============================================================================
