@@ -758,7 +758,8 @@ HELP_CATEGORIES = {
         ("!config", "Affiche la configuration."),
         ("!setlog #salon", "Salon des joins."),
         ("!setscan #salon", "Salon des scans."),
-        ("!setemoji <cle> <emoji>", "Ton emoji perso sur un critere."),
+        ("!setemoji", "Gerer les emojis des criteres (menu)."),
+        ("!create <emojis>", "Cree des emojis sur le serveur (depuis d'autres serveurs)."),
         ("!setmsg <texte>", "Titre du message de join."),
     ],
     "👑 Gestion": [
@@ -892,6 +893,111 @@ class BaremeView(AuthorView):
         self.add_item(BaremeSelect())
 
 
+# --- !setemoji : categorie -> element -> fenetre (modal) ---
+
+EMOJI_CATEGORIES = {c: [k for k in keys if k in DEFAULT_EMOJIS]
+                    for c, keys in CATEGORIES.items() if any(k in DEFAULT_EMOJIS for k in keys)}
+
+
+def embed_emoji_accueil():
+    return discord.Embed(title="😀 Emojis des criteres",
+                         description="Choisis une categorie, puis l'element dont tu veux changer l'emoji.",
+                         color=discord.Color.blurple())
+
+
+def embed_emoji_cat(cat):
+    e = discord.Embed(title=f"😀 Emojis — {cat}", description="Choisis l'element a modifier.",
+                      color=discord.Color.blurple())
+    lignes = [f"{emoji_de(k)} {SET_ITEMS[k]['label']}" for k in EMOJI_CATEGORIES[cat]]
+    e.add_field(name="Emojis actuels", value="\n".join(lignes), inline=False)
+    return e
+
+
+def embed_emoji_item(key):
+    e = discord.Embed(title=f"😀 {SET_ITEMS[key]['label']}", color=discord.Color.blurple())
+    e.add_field(name="Emoji actuel", value=emoji_de(key), inline=False)
+    e.set_footer(text="Clique sur Modifier pour le changer.")
+    return e
+
+
+class EmojiModal(discord.ui.Modal):
+    def __init__(self, author, guild, key):
+        super().__init__(title="Definir l'emoji")
+        self.author = author
+        self.guild = guild
+        self.key = key
+        self.champ = discord.ui.TextInput(label=SET_ITEMS[key]["label"][:45],
+                                          placeholder="Colle ton emoji ici", max_length=100)
+        self.add_item(self.champ)
+
+    async def on_submit(self, interaction):
+        definir_emoji(self.key, str(self.champ.value).strip())
+        await interaction.response.edit_message(
+            embed=embed_emoji_item(self.key),
+            view=EmojiItemActionsView(self.author, self.guild, self.key))
+
+
+class ModifierEmojiBouton(discord.ui.Button):
+    def __init__(self, key):
+        super().__init__(label="✏️ Modifier", style=discord.ButtonStyle.primary)
+        self.key = key
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(EmojiModal(self.view.author, self.view.guild, self.key))
+
+
+class RetourEmojiBouton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="◀ Retour", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(embed=embed_emoji_accueil(),
+                                                view=EmojiRootView(self.view.author, self.view.guild))
+
+
+class EmojiItemActionsView(AuthorView):
+    def __init__(self, author, guild, key):
+        super().__init__(author, guild)
+        self.add_item(ModifierEmojiBouton(key))
+        self.add_item(RetourEmojiBouton())
+
+
+class EmojiCategorySelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="Choisis une categorie…",
+                         options=[discord.SelectOption(label=c, value=c) for c in EMOJI_CATEGORIES])
+
+    async def callback(self, interaction):
+        cat = self.values[0]
+        await interaction.response.edit_message(embed=embed_emoji_cat(cat),
+                                                view=EmojiItemView(self.view.author, self.view.guild, cat))
+
+
+class EmojiItemSelect(discord.ui.Select):
+    def __init__(self, cat):
+        super().__init__(placeholder=f"{cat} — choisis l'element…",
+                         options=[discord.SelectOption(label=SET_ITEMS[k]["label"], value=k)
+                                  for k in EMOJI_CATEGORIES[cat]])
+
+    async def callback(self, interaction):
+        key = self.values[0]
+        await interaction.response.edit_message(embed=embed_emoji_item(key),
+                                                view=EmojiItemActionsView(self.view.author, self.view.guild, key))
+
+
+class EmojiRootView(AuthorView):
+    def __init__(self, author, guild):
+        super().__init__(author, guild)
+        self.add_item(EmojiCategorySelect())
+
+
+class EmojiItemView(AuthorView):
+    def __init__(self, author, guild, cat):
+        super().__init__(author, guild)
+        self.add_item(EmojiItemSelect(cat))
+        self.add_item(RetourEmojiBouton())
+
+
 # ==============================================================================
 #  COMMANDES
 # ==============================================================================
@@ -933,12 +1039,39 @@ async def setalert(ctx, role: discord.Role):
 
 @bot.command(name="setemoji")
 @check_owner()
-async def setemoji(ctx, cle: str = None, emoji: str = None):
-    if cle not in DEFAULT_EMOJIS or emoji is None:
-        await ctx.send(f"Utilisation : `!setemoji <cle> <emoji>`\nCles : {', '.join(f'`{k}`' for k in DEFAULT_EMOJIS)}")
+async def setemoji(ctx):
+    await ctx.send(embed=embed_emoji_accueil(), view=EmojiRootView(ctx.author, ctx.guild))
+
+
+@bot.command(name="create")
+@check_owner()
+async def create(ctx, emojis: commands.Greedy[discord.PartialEmoji]):
+    """Cree un ou plusieurs emojis sur le serveur depuis d'autres serveurs.
+    Ex: !create <:foo:123> <:bar:456> ..."""
+    if not emojis:
+        await ctx.send("Utilisation : `!create <emoji1> <emoji2> ...` "
+                       "(des emojis personnalises d'autres serveurs).")
         return
-    definir_emoji(cle, emoji)
-    await ctx.send(f"✅ **{SET_ITEMS[cle]['label']}** utilise maintenant {emoji}.")
+    crees, echecs = [], []
+    for em in emojis:
+        if not em.id:  # emoji standard (unicode) -> non creable
+            echecs.append(f"{em} (emoji standard)")
+            continue
+        try:
+            data = await em.read()
+            nouvel = await ctx.guild.create_custom_emoji(
+                name=em.name, image=data, reason=f"!create par {ctx.author}")
+            crees.append(str(nouvel))
+        except discord.Forbidden:
+            echecs.append(f"`{em.name}` (permission 'Gerer les emojis' manquante)")
+        except discord.HTTPException as e:
+            echecs.append(f"`{em.name}` ({getattr(e, 'text', 'erreur / limite atteinte')})")
+    embed = discord.Embed(title="✨ Creation d'emojis", color=discord.Color.green())
+    if crees:
+        embed.add_field(name=f"✅ Crees ({len(crees)})", value=" ".join(crees)[:1024], inline=False)
+    if echecs:
+        embed.add_field(name=f"❌ Echecs ({len(echecs)})", value="\n".join(echecs)[:1024], inline=False)
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="setmsg")
