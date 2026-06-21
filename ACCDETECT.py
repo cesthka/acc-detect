@@ -4,8 +4,8 @@
   buyer/owner · SQLite · !set/!scan par categorie · boost · niveau de rarete
 ================================================================================
 NOTE: les badges Nitro (Bronze..Opale) ne sont PAS exposes par l'API Discord et
-ne peuvent donc pas etre detectes par un bot. On detecte a la place le BOOST de
-ce serveur (via premium_since) et un "Nitro probable" (avatar anime/banniere).
+ne peuvent donc pas etre detectes par un bot. On detecte uniquement le BOOST de
+ce serveur (via premium_since).
 ================================================================================
 """
 
@@ -57,7 +57,6 @@ SET_ITEMS = {
     "mod":        {"label": "Moderator Programs Alumni",  "type": "role"},
     "partner":    {"label": "Partenaire Discord",         "type": "role"},
     "staff":      {"label": "Staff Discord",              "type": "role"},
-    "nitro":      {"label": "Nitro (probable)",           "type": "role"},
     "boost1":     {"label": "Boost 1 mois",               "type": "role"},
     "boost2":     {"label": "Boost 2 mois",               "type": "role"},
     "boost3":     {"label": "Boost 3 mois",               "type": "role"},
@@ -82,7 +81,7 @@ SET_ITEMS = {
 CATEGORIES = {
     "🏅 Badges":        ["early", "hypesquad", "bravery", "brilliance", "balance",
                          "bughunter", "bughunter2", "botdev", "mod", "partner", "staff"],
-    "💎 Nitro & Boost": ["nitro", "boost1", "boost2", "boost3", "boost6", "boost9",
+    "🚀 Boost":         ["boost1", "boost2", "boost3", "boost6", "boost9",
                          "boost12", "boost15", "boost18", "boost24"],
     "📅 Anciennete":    ["og2016", "og2017", "og2018"],
     "✨ Pseudo":        ["pseudo2", "pseudo3", "mot", "chiffres"],
@@ -96,7 +95,7 @@ DETECT_KEYS = [k for k, v in SET_ITEMS.items() if v["type"] == "role" and k != "
 DEFAULT_EMOJIS = {
     "early": "🥇", "hypesquad": "🎉", "bravery": "🛡️", "brilliance": "🔮", "balance": "⚖️",
     "bughunter": "🐛", "bughunter2": "🐛", "botdev": "🤖", "mod": "🛡️", "partner": "🤝", "staff": "👑",
-    "nitro": "💎", "boost1": "🚀", "boost2": "🚀", "boost3": "🚀", "boost6": "🚀", "boost9": "🚀",
+    "boost1": "🚀", "boost2": "🚀", "boost3": "🚀", "boost6": "🚀", "boost9": "🚀",
     "boost12": "🚀", "boost15": "🚀", "boost18": "🚀", "boost24": "🚀",
     "og2016": "📅", "og2017": "📅", "og2018": "📅",
     "pseudo2": "✨", "pseudo3": "✨", "mot": "🔤", "chiffres": "🔢",
@@ -113,8 +112,7 @@ POIDS = {
     "og2016": 5, "og2017": 3, "og2018": 2,
     # Pseudo
     "pseudo2": 5, "pseudo3": 3, "mot": 2, "chiffres": 1,
-    # Nitro / Boost (bonus, faible poids)
-    "nitro": 1,
+    # Boost (bonus, faible poids)
     "boost1": 1, "boost2": 1, "boost3": 2, "boost6": 2, "boost9": 3,
     "boost12": 3, "boost15": 4, "boost18": 4, "boost24": 5,
 }
@@ -303,42 +301,22 @@ def detecter_boost(member):
     return "boost1"  # boost depuis moins d'un mois
 
 
-def detecter_nitro_probable(member):
-    """Indices RAPIDES de Nitro (sans appel reseau) : avatar anime ou decoration."""
-    for av in (getattr(member, "avatar", None),
-               getattr(member, "guild_avatar", None),
-               getattr(member, "display_avatar", None)):
-        try:
-            if av and av.is_animated():
-                return True
-        except Exception:
-            pass
-    if getattr(member, "avatar_decoration", None) or getattr(member, "avatar_decoration_data", None):
-        return True
-    return False
-
-
 def collecter_infos(member):
     return {
         "badges": detecter_badges(member),
         "pseudo": detecter_pseudo(member),
         "anciennete": detecter_anciennete(member),
         "boost": detecter_boost(member),
-        "nitro": detecter_nitro_probable(member),
         "erreurs": [],
     }
 
 
-async def enrichir_nitro(member, infos):
-    """Affine la detection Nitro avec la BANNIERE (signe Nitro fiable), via un fetch.
-    Renvoie l'utilisateur complet (pour reutiliser la banniere dans l'embed)."""
+async def recuperer_user(member):
+    """Recupere l'utilisateur complet (pour afficher sa banniere dans l'embed)."""
     try:
-        u = await bot.fetch_user(member.id)
+        return await bot.fetch_user(member.id)
     except Exception:
         return None
-    if not infos["nitro"] and (u.banner or getattr(u, "avatar_decoration", None)):
-        infos["nitro"] = True
-    return u
 
 
 OG_THRESHOLDS = dict(OG_SEUILS)
@@ -350,8 +328,6 @@ def membre_a_cle(member, key):
     if key in BOOST_MOIS:
         mois = mois_de_boost(member)
         return mois is not None and mois >= BOOST_MOIS[key]
-    if key == "nitro":
-        return detecter_nitro_probable(member)
     if key in ("pseudo2", "pseudo3", "mot", "chiffres"):
         return key in detecter_pseudo(member)
     return key in detecter_badges(member)
@@ -366,8 +342,6 @@ async def attribuer_roles_depuis(member, infos):
     for extra in (infos["anciennete"], infos["boost"]):
         if extra:
             cles.append(extra)
-    if infos["nitro"]:
-        cles.append("nitro")
     role_ids = {CONFIG.get(c, 0) for c in cles}
     role_ids.discard(0)
     roles = [r for rid in role_ids if (r := member.guild.get_role(rid)) and r not in member.roles]
@@ -387,7 +361,7 @@ async def appliquer_roles(member):
 
 
 def est_notable(infos):
-    return bool(infos["badges"] or infos["pseudo"] or infos["anciennete"] or infos["boost"] or infos["nitro"])
+    return bool(infos["badges"] or infos["pseudo"] or infos["anciennete"] or infos["boost"])
 
 
 # ==============================================================================
@@ -401,8 +375,6 @@ def score_rarete(infos):
         s += POIDS.get(infos["anciennete"], 0)
     if infos["boost"]:
         s += POIDS.get(infos["boost"], 0)
-    if infos["nitro"]:
-        s += POIDS.get("nitro", 0)
     return s
 
 
@@ -443,13 +415,11 @@ def embed_profil(member, infos, titre):
     if member.joined_at:
         embed.add_field(name="📥 A rejoint", value=f"<t:{int(member.joined_at.timestamp())}:R>", inline=True)
 
-    # Badges = emojis seuls (badges + pseudo + anciennete + boost + nitro), sans texte.
+    # Badges = emojis seuls (badges + pseudo + anciennete + boost), sans texte.
     cles = list(infos["badges"]) + list(infos["pseudo"])
     for extra in (infos["anciennete"], infos["boost"]):
         if extra:
             cles.append(extra)
-    if infos["nitro"]:
-        cles.append("nitro")
     ligne = "  ".join(emoji_de(k) for k in cles) if cles else "—"
     embed.add_field(name="🏅 Badges", value=ligne, inline=False)
 
@@ -873,7 +843,7 @@ class ListItemView(AuthorView):
 
 # --- !bareme : par categorie ---
 
-BAREME_CATS = ["🏅 Badges", "💎 Nitro & Boost", "📅 Anciennete", "✨ Pseudo"]
+BAREME_CATS = ["🏅 Badges", "🚀 Boost", "📅 Anciennete", "✨ Pseudo"]
 
 
 def embed_bareme_accueil():
@@ -1110,7 +1080,7 @@ async def scan(ctx):
 async def profil(ctx, member: discord.Member = None):
     member = member or ctx.author
     infos = collecter_infos(member)
-    u = await enrichir_nitro(member, infos)   # affine le Nitro via la banniere
+    u = await recuperer_user(member)
     embed = embed_profil(member, infos, f"🔎 Profil de {member.name}")
     if u and u.banner:
         embed.set_image(url=u.banner.url)
@@ -1164,8 +1134,6 @@ async def stats(ctx):
         for extra in (infos["anciennete"], infos["boost"]):
             if extra:
                 compteur[extra] += 1
-        if infos["nitro"]:
-            compteur["nitro"] += 1
         _, niv, _, _ = niveau_rarete(infos)
         niveaux_count[niv] += 1
 
@@ -1178,7 +1146,7 @@ async def stats(ctx):
                            for k in CATEGORIES["🏅 Badges"] if compteur[k]) or "—"
     embed.add_field(name="Badges", value=badges_txt, inline=True)
     autres = []
-    for cat in ("💎 Nitro & Boost", "📅 Anciennete", "✨ Pseudo"):
+    for cat in ("🚀 Boost", "📅 Anciennete", "✨ Pseudo"):
         for k in CATEGORIES[cat]:
             if k in compteur and compteur[k]:
                 autres.append(f"{emoji_de(k)} {SET_ITEMS[k]['label']} : {compteur[k]}")
@@ -1259,8 +1227,8 @@ async def on_member_join(member):
     if member.bot:
         return
     infos = collecter_infos(member)
-    u = await enrichir_nitro(member, infos)          # Nitro affine via la banniere
-    await attribuer_roles_depuis(member, infos)      # attribue les roles (nitro inclus)
+    u = await recuperer_user(member)                 # pour la banniere dans le log
+    await attribuer_roles_depuis(member, infos)      # attribue les roles
     if est_notable(infos):
         await envoyer_log_join(member.guild, member, infos, u)
 
