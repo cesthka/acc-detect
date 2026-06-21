@@ -13,6 +13,7 @@ import os
 import datetime
 import sqlite3
 from io import BytesIO
+import aiohttp
 import discord
 from discord.ext import commands
 
@@ -23,7 +24,7 @@ except ImportError:
     WORDFREQ_OK = False
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
     PIL_OK = True
 except ImportError:
     PIL_OK = False
@@ -148,6 +149,7 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS owners   (user_id INTEGER PRIMARY KEY)")
     conn.execute("CREATE TABLE IF NOT EXISTS emojis   (key TEXT PRIMARY KEY, emoji TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS messages (key TEXT PRIMARY KEY, contenu TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS fond     (id INTEGER PRIMARY KEY, data BLOB)")
     conn.commit(); conn.close()
 
 
@@ -197,11 +199,29 @@ def retirer_owner(uid):
     conn.commit(); conn.close(); OWNERS.discard(uid)
 
 
+def charger_fond():
+    conn = db()
+    row = conn.execute("SELECT data FROM fond WHERE id=1").fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def definir_fond(data):
+    global FOND_DATA
+    FOND_DATA = data
+    conn = db()
+    conn.execute("DELETE FROM fond")
+    if data is not None:
+        conn.execute("INSERT INTO fond (id, data) VALUES (1, ?)", (data,))
+    conn.commit(); conn.close()
+
+
 init_db()
 CONFIG = _charger("config", "key", "value")
 EMOJIS = _charger("emojis", "key", "emoji")
 MESSAGES = _charger("messages", "key", "contenu")
 OWNERS = charger_owners()
+FOND_DATA = charger_fond()
 
 
 def emoji_de(key):
@@ -476,7 +496,6 @@ def _police(taille, gras=False):
 
 
 def _ajuster(draw, texte, font, maxw):
-    """Tronque un texte avec '...' pour qu'il tienne dans maxw pixels."""
     if draw.textlength(texte, font=font) <= maxw:
         return texte
     while texte and draw.textlength(texte + "…", font=font) > maxw:
@@ -484,73 +503,161 @@ def _ajuster(draw, texte, font, maxw):
     return texte + "…"
 
 
-async def generer_carte(member, infos):
-    """Genere une carte de profil en image (PNG) et renvoie un buffer BytesIO."""
-    score, niveau, _, couleur = niveau_rarete(infos)
-    rgb = (couleur.r, couleur.g, couleur.b)
-    L, H = 820, 360
+def _melange(c, rgb, f):
+    return tuple(int(c[i] + (rgb[i] - c[i]) * f) for i in range(3))
 
-    carte = Image.new("RGBA", (L, H), (30, 31, 34, 255))
 
-    # Fond : banniere assombrie si dispo
-    u = await recuperer_user(member)
-    if u and u.banner:
-        try:
-            bdata = await u.banner.replace(size=512, static_format="png").read()
-            ban = Image.open(BytesIO(bdata)).convert("RGBA").resize((L, H))
-            carte = Image.alpha_composite(ban, Image.new("RGBA", (L, H), (0, 0, 0, 180)))
-        except Exception:
-            pass
-    draw = ImageDraw.Draw(carte)
-
-    # Bande d'accent coloree (niveau) a gauche
-    draw.rectangle([0, 0, 12, H], fill=rgb + (255,))
-
-    # Avatar circulaire avec contour
+async def _telecharger(url):
     try:
-        adata = await member.display_avatar.replace(size=256, static_format="png").read()
-        av = Image.open(BytesIO(adata)).convert("RGBA").resize((180, 180))
-        mask = Image.new("L", (180, 180), 0)
-        ImageDraw.Draw(mask).ellipse([0, 0, 180, 180], fill=255)
-        carte.paste(av, (45, 90), mask)
-        draw.ellipse([45, 90, 225, 270], outline=rgb + (255,), width=5)
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    return await r.read()
     except Exception:
         pass
+    return None
 
-    f_titre = _police(46, gras=True)
-    f_sous = _police(24)
-    f_petit = _police(22)
-    f_chip = _police(26, gras=True)
-    blanc, gris = (255, 255, 255, 255), (185, 187, 190, 255)
-    x, maxw = 260, L - 260 - 30
 
-    draw.text((x, 48), _ajuster(draw, member.name, f_titre, maxw), font=f_titre, fill=blanc)
-    draw.text((x, 110), f"ID : {member.id}", font=f_petit, fill=gris)
+def _couvrir(img, L, H):
+    """Redimensionne en 'cover' (remplit L x H, recadre le surplus au centre)."""
+    iw, ih = img.size
+    echelle = max(L / iw, H / ih)
+    nw, nh = max(1, int(iw * echelle)), max(1, int(ih * echelle))
+    img = img.resize((nw, nh))
+    gx, gy = (nw - L) // 2, (nh - H) // 2
+    return img.crop((gx, gy, gx + L, gy + H))
 
-    # Pastille de niveau
-    chip = f"{niveau.upper()}  -  {score} PTS"
-    bb = draw.textbbox((0, 0), chip, font=f_chip)
-    cw, ch = bb[2] - bb[0], bb[3] - bb[1]
-    draw.rounded_rectangle([x, 152, x + cw + 40, 152 + ch + 26], radius=18, fill=rgb + (255,))
-    draw.text((x + 20, 162), chip, font=f_chip, fill=(20, 20, 20, 255))
 
-    # Anciennete
-    age = datetime.datetime.now(datetime.timezone.utc) - member.created_at
-    annees, jours = age.days // 365, age.days % 365
-    draw.text((x, 226),
-              f"Cree le {member.created_at.strftime('%d/%m/%Y')}  ({annees} an(s) {jours} j)",
-              font=f_sous, fill=gris)
+def _fond_degrade(L, H, c1, c2):
+    base = Image.new("RGBA", (L, H))
+    d = ImageDraw.Draw(base)
+    for y in range(H):
+        t = y / max(1, H - 1)
+        col = tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3)) + (255,)
+        d.line([(0, y), (L, y)], fill=col)
+    return base
 
-    # Attributs (texte ; pas d'emoji car Pillow gere mal les emojis couleur)
+
+def _progression(score):
+    """Renvoie (fraction 0..1 vers le palier suivant, score du palier suivant ou None)."""
+    idx = 0
+    for i, (s, *_rest) in enumerate(NIVEAUX):
+        if score >= s:
+            idx = i
+    cur = NIVEAUX[idx][0]
+    if idx + 1 < len(NIVEAUX):
+        nxt = NIVEAUX[idx + 1][0]
+        frac = (score - cur) / (nxt - cur) if nxt > cur else 1.0
+        return max(0.0, min(1.0, frac)), nxt
+    return 1.0, None
+
+
+async def generer_carte(member, infos):
+    """Genere une carte de profil en image (PNG) soignee, renvoie un buffer BytesIO."""
+    score, niveau, _, couleur = niveau_rarete(infos)
+    rgb = (couleur.r, couleur.g, couleur.b)
+    L = 900
+
+    f_nom = _police(54, gras=True)
+    f_id = _police(24)
+    f_pill = _police(26, gras=True)
+    f_pet = _police(22)
+    f_chip = _police(22)
+
+    # Attributs -> pastilles
     cles = list(infos["badges"]) + list(infos["pseudo"])
     for extra in (infos["anciennete"], infos["boost"]):
         if extra:
             cles.append(extra)
     labels = [SET_ITEMS[k]["label"] for k in cles] or ["Compte standard"]
-    draw.text((x, 272), _ajuster(draw, " · ".join(labels), f_petit, maxw), font=f_petit, fill=blanc)
+
+    # Mesure prealable pour calculer le nombre de lignes de pastilles -> hauteur
+    mes = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    pad, gap, ch = 18, 12, 38
+    x_chip, maxx = 55, L - 45
+    chip_w = [mes.textlength(lab, font=f_chip) + pad * 2 for lab in labels]
+    cur, rows = x_chip, 1
+    for w in chip_w:
+        if cur + w > maxx and cur > x_chip:
+            rows += 1
+            cur = x_chip
+        cur += w + gap
+    cy0 = 388
+    H = cy0 + rows * ch + (rows - 1) * gap + 22
+
+    # --- Fond : 1) fond personnalise  2) banniere du compte  3) degrade ---
+    carte = _fond_degrade(L, H, _melange((40, 42, 50), rgb, 0.10), (18, 19, 22))
+    fond_pose = False
+    if FOND_DATA:
+        try:
+            img = Image.open(BytesIO(FOND_DATA)).convert("RGBA")
+            carte = Image.alpha_composite(_couvrir(img, L, H), Image.new("RGBA", (L, H), (0, 0, 0, 135)))
+            fond_pose = True
+        except Exception:
+            pass
+    if not fond_pose:
+        u = await recuperer_user(member)
+        if u and u.banner:
+            try:
+                bdata = await u.banner.replace(size=600, static_format="png").read()
+                ban = Image.open(BytesIO(bdata)).convert("RGBA").resize((L, H)).filter(ImageFilter.GaussianBlur(14))
+                carte = Image.alpha_composite(ban, Image.new("RGBA", (L, H), (0, 0, 0, 165)))
+            except Exception:
+                pass
+    draw = ImageDraw.Draw(carte)
+    blanc, gris, fonce = (255, 255, 255, 255), (181, 186, 193, 255), (46, 48, 56, 255)
+
+    # --- Avatar + anneau ---
+    ax, ay, ad, ring = 55, 130, 200, 7
+    draw.ellipse([ax - ring, ay - ring, ax + ad + ring, ay + ad + ring], fill=rgb + (255,))
+    try:
+        adata = await member.display_avatar.replace(size=256, static_format="png").read()
+        av = Image.open(BytesIO(adata)).convert("RGBA").resize((ad, ad))
+        m = Image.new("L", (ad, ad), 0)
+        ImageDraw.Draw(m).ellipse([0, 0, ad, ad], fill=255)
+        carte.paste(av, (ax, ay), m)
+    except Exception:
+        draw.ellipse([ax, ay, ax + ad, ay + ad], fill=fonce)
+
+    x = 300
+    maxw = L - x - 45
+    draw.text((x, 120), _ajuster(draw, member.name, f_nom, maxw), font=f_nom, fill=blanc)
+    draw.text((x, 188), f"ID {member.id}", font=f_id, fill=gris)
+
+    # Pastille de niveau
+    txt = f"{niveau.upper()}   {score} PTS"
+    tw = draw.textlength(txt, font=f_pill)
+    py = 232
+    draw.rounded_rectangle([x, py, x + tw + 44, py + 48], radius=24, fill=rgb + (255,))
+    draw.text((x + 22, py + 24), txt, font=f_pill, fill=(18, 18, 20, 255), anchor="lm")
+
+    # Barre de progression
+    frac, nxt = _progression(score)
+    bx, by, bw, bh = x, 312, maxw, 20
+    draw.rounded_rectangle([bx, by, bx + bw, by + bh], radius=bh // 2, fill=fonce)
+    if frac > 0:
+        draw.rounded_rectangle([bx, by, bx + max(bh, int(bw * frac)), by + bh], radius=bh // 2, fill=rgb + (255,))
+    label = f"{score} pts → {nxt} pts pour le palier suivant" if nxt else "Palier maximum atteint"
+    draw.text((bx, by + bh + 14), label, font=f_pet, fill=gris, anchor="lt")
+
+    # Pastilles d'attributs (multi-lignes)
+    cxx, cyy = x_chip, cy0
+    for lab, w in zip(labels, chip_w):
+        if cxx + w > maxx and cxx > x_chip:
+            cxx, cyy = x_chip, cyy + ch + gap
+        draw.rounded_rectangle([cxx, cyy, cxx + w, cyy + ch], radius=ch // 2,
+                               fill=fonce, outline=rgb + (255,), width=2)
+        draw.text((cxx + pad, cyy + ch // 2), lab, font=f_chip, fill=(225, 227, 230, 255), anchor="lm")
+        cxx += w + gap
+
+    # Coins arrondis
+    masque = Image.new("L", (L, H), 0)
+    ImageDraw.Draw(masque).rounded_rectangle([0, 0, L - 1, H - 1], radius=34, fill=255)
+    final = Image.new("RGBA", (L, H), (0, 0, 0, 0))
+    final.paste(carte, (0, 0), masque)
 
     buf = BytesIO()
-    carte.convert("RGB").save(buf, format="PNG")
+    final.save(buf, format="PNG")
     buf.seek(0)
     return buf
 
@@ -856,6 +963,7 @@ HELP_CATEGORIES = {
         ("!setemoji", "Gerer les emojis des criteres (menu)."),
         ("!create <emojis>", "Cree des emojis sur le serveur (depuis d'autres serveurs)."),
         ("!setmsg <texte>", "Titre du message de join."),
+        ("!setfond <url|image>", "Fond personnalise des cartes (`reset` pour enlever)."),
     ],
     "👑 Gestion": [
         ("!owner @membre", "Ajoute un owner (buyer)."),
@@ -1176,6 +1284,43 @@ async def setmsg(ctx, *, texte: str = None):
         await ctx.send("Utilisation : `!setmsg <texte>`"); return
     definir_message("join", texte)
     await ctx.send(f"✅ Titre de join : {texte}")
+
+
+@bot.command(name="setfond", aliases=["setbg", "setbackground"])
+@check_owner()
+async def setfond(ctx, url: str = None):
+    """Definit le fond des cartes. Joins une image OU donne une URL. `!setfond reset` pour enlever."""
+    if not PIL_OK:
+        await ctx.send("Pillow n'est pas installe."); return
+
+    if url and url.lower() in ("reset", "clear", "off", "none"):
+        definir_fond(None)
+        await ctx.send("✅ Fond personnalise retire. Les cartes reprennent le fond par defaut.")
+        return
+
+    if ctx.message.attachments:
+        url = ctx.message.attachments[0].url
+    if not url:
+        await ctx.send("Donne une image : `!setfond <url>` ou **joins une image** au message.\n"
+                       "Pour enlever : `!setfond reset`.")
+        return
+
+    async with ctx.typing():
+        data = await _telecharger(url)
+        if not data:
+            await ctx.send("❌ Impossible de telecharger cette image (lien invalide ou expire ?)."); return
+        try:
+            img = Image.open(BytesIO(data)).convert("RGB")
+        except Exception:
+            await ctx.send("❌ Ce fichier n'est pas une image valide."); return
+        # Re-encode en taille bornee pour garder la base legere (et eviter les liens qui expirent)
+        img = _couvrir(img, 900, 520)
+        buf = BytesIO(); img.save(buf, format="JPEG", quality=85)
+        definir_fond(buf.getvalue())
+
+    apercu = discord.File(BytesIO(buf.getvalue()), filename="fond.jpg")
+    await ctx.send("✅ Fond de carte enregistre ! Voici l'apercu (utilise `!carte` pour voir le rendu final) :",
+                   file=apercu)
 
 
 @bot.command(name="scan")
