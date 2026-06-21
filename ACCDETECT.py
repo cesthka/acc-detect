@@ -12,6 +12,7 @@ ce serveur (via premium_since).
 import os
 import datetime
 import sqlite3
+from io import BytesIO
 import discord
 from discord.ext import commands
 
@@ -20,6 +21,12 @@ try:
     WORDFREQ_OK = True
 except ImportError:
     WORDFREQ_OK = False
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
 
 # ==============================================================================
 #  REGLAGES DE BASE
@@ -448,6 +455,107 @@ async def envoyer_log_join(guild, member, infos, user=None):
 
 
 # ==============================================================================
+#  CARTE PROFIL EN IMAGE (Pillow)
+# ==============================================================================
+
+def _police(taille, gras=False):
+    chemins = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if gras
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if gras
+        else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf" if gras
+        else "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    ]
+    for c in chemins:
+        try:
+            return ImageFont.truetype(c, taille)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _ajuster(draw, texte, font, maxw):
+    """Tronque un texte avec '...' pour qu'il tienne dans maxw pixels."""
+    if draw.textlength(texte, font=font) <= maxw:
+        return texte
+    while texte and draw.textlength(texte + "…", font=font) > maxw:
+        texte = texte[:-1]
+    return texte + "…"
+
+
+async def generer_carte(member, infos):
+    """Genere une carte de profil en image (PNG) et renvoie un buffer BytesIO."""
+    score, niveau, _, couleur = niveau_rarete(infos)
+    rgb = (couleur.r, couleur.g, couleur.b)
+    L, H = 820, 360
+
+    carte = Image.new("RGBA", (L, H), (30, 31, 34, 255))
+
+    # Fond : banniere assombrie si dispo
+    u = await recuperer_user(member)
+    if u and u.banner:
+        try:
+            bdata = await u.banner.replace(size=512, static_format="png").read()
+            ban = Image.open(BytesIO(bdata)).convert("RGBA").resize((L, H))
+            carte = Image.alpha_composite(ban, Image.new("RGBA", (L, H), (0, 0, 0, 180)))
+        except Exception:
+            pass
+    draw = ImageDraw.Draw(carte)
+
+    # Bande d'accent coloree (niveau) a gauche
+    draw.rectangle([0, 0, 12, H], fill=rgb + (255,))
+
+    # Avatar circulaire avec contour
+    try:
+        adata = await member.display_avatar.replace(size=256, static_format="png").read()
+        av = Image.open(BytesIO(adata)).convert("RGBA").resize((180, 180))
+        mask = Image.new("L", (180, 180), 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, 180, 180], fill=255)
+        carte.paste(av, (45, 90), mask)
+        draw.ellipse([45, 90, 225, 270], outline=rgb + (255,), width=5)
+    except Exception:
+        pass
+
+    f_titre = _police(46, gras=True)
+    f_sous = _police(24)
+    f_petit = _police(22)
+    f_chip = _police(26, gras=True)
+    blanc, gris = (255, 255, 255, 255), (185, 187, 190, 255)
+    x, maxw = 260, L - 260 - 30
+
+    draw.text((x, 48), _ajuster(draw, member.name, f_titre, maxw), font=f_titre, fill=blanc)
+    draw.text((x, 110), f"ID : {member.id}", font=f_petit, fill=gris)
+
+    # Pastille de niveau
+    chip = f"{niveau.upper()}  -  {score} PTS"
+    bb = draw.textbbox((0, 0), chip, font=f_chip)
+    cw, ch = bb[2] - bb[0], bb[3] - bb[1]
+    draw.rounded_rectangle([x, 152, x + cw + 40, 152 + ch + 26], radius=18, fill=rgb + (255,))
+    draw.text((x + 20, 162), chip, font=f_chip, fill=(20, 20, 20, 255))
+
+    # Anciennete
+    age = datetime.datetime.now(datetime.timezone.utc) - member.created_at
+    annees, jours = age.days // 365, age.days % 365
+    draw.text((x, 226),
+              f"Cree le {member.created_at.strftime('%d/%m/%Y')}  ({annees} an(s) {jours} j)",
+              font=f_sous, fill=gris)
+
+    # Attributs (texte ; pas d'emoji car Pillow gere mal les emojis couleur)
+    cles = list(infos["badges"]) + list(infos["pseudo"])
+    for extra in (infos["anciennete"], infos["boost"]):
+        if extra:
+            cles.append(extra)
+    labels = [SET_ITEMS[k]["label"] for k in cles] or ["Compte standard"]
+    draw.text((x, 272), _ajuster(draw, " · ".join(labels), f_petit, maxw), font=f_petit, fill=blanc)
+
+    buf = BytesIO()
+    carte.convert("RGB").save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+# ==============================================================================
 #  VUES
 # ==============================================================================
 
@@ -734,6 +842,7 @@ HELP_CATEGORIES = {
     "🔍 Detection": [
         ("!scan", "Lister les membres d'un critere (vers le salon de scan)."),
         ("!profil @membre", "Profil complet d'un membre."),
+        ("!carte @membre", "Carte de profil en image (avatar, niveau, badges)."),
         ("!list", "Liste des membres d'un critere (menu deroulant)."),
         ("!stats", "Tableau de bord global du serveur."),
         ("!top", "Classement des comptes les plus rares."),
@@ -1085,6 +1194,20 @@ async def profil(ctx, member: discord.Member = None):
     if u and u.banner:
         embed.set_image(url=u.banner.url)
     await ctx.send(embed=embed)
+
+
+@bot.command(name="carte", aliases=["card"])
+@check_owner()
+async def carte(ctx, member: discord.Member = None):
+    """Genere une carte de profil en image. Ex: !carte @membre"""
+    if not PIL_OK:
+        await ctx.send("La librairie Pillow n'est pas installee (ajoute `Pillow` aux dependances).")
+        return
+    member = member or ctx.author
+    infos = collecter_infos(member)
+    async with ctx.typing():
+        buf = await generer_carte(member, infos)
+    await ctx.send(file=discord.File(buf, filename="profil.png"))
 
 
 @bot.command(name="list")
