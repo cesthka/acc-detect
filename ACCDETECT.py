@@ -150,6 +150,7 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS emojis   (key TEXT PRIMARY KEY, emoji TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS messages (key TEXT PRIMARY KEY, contenu TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS fond     (id INTEGER PRIMARY KEY, data BLOB)")
+    conn.execute("CREATE TABLE IF NOT EXISTS salons_public (channel_id INTEGER PRIMARY KEY)")
     conn.commit(); conn.close()
 
 
@@ -216,12 +217,28 @@ def definir_fond(data):
     conn.commit(); conn.close()
 
 
+def charger_salons_public():
+    conn = db(); rows = conn.execute("SELECT channel_id FROM salons_public").fetchall(); conn.close()
+    return {r[0] for r in rows}
+
+
+def ajouter_salon_public(cid):
+    conn = db(); conn.execute("INSERT OR IGNORE INTO salons_public (channel_id) VALUES (?)", (cid,))
+    conn.commit(); conn.close(); SALONS_PUBLIC.add(cid)
+
+
+def retirer_salon_public(cid):
+    conn = db(); conn.execute("DELETE FROM salons_public WHERE channel_id=?", (cid,))
+    conn.commit(); conn.close(); SALONS_PUBLIC.discard(cid)
+
+
 init_db()
 CONFIG = _charger("config", "key", "value")
 EMOJIS = _charger("emojis", "key", "emoji")
 MESSAGES = _charger("messages", "key", "contenu")
 OWNERS = charger_owners()
 FOND_DATA = charger_fond()
+SALONS_PUBLIC = charger_salons_public()
 
 
 def emoji_de(key):
@@ -247,6 +264,13 @@ def check_buyer():
 
 def check_owner():
     async def predicate(ctx): return est_owner(ctx.author.id)
+    return commands.check(predicate)
+
+
+def check_public():
+    """Owner partout, OU n'importe qui dans un salon autorise via !allow."""
+    async def predicate(ctx):
+        return est_owner(ctx.author.id) or (ctx.guild is not None and ctx.channel.id in SALONS_PUBLIC)
     return commands.check(predicate)
 
 
@@ -478,21 +502,57 @@ async def envoyer_log_join(guild, member, infos, user=None):
 #  CARTE PROFIL EN IMAGE (Pillow)
 # ==============================================================================
 
-def _police(taille, gras=False):
-    chemins = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if gras
-        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if gras
-        else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf" if gras
-        else "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    ]
-    for c in chemins:
-        try:
-            return ImageFont.truetype(c, taille)
-        except Exception:
+# --- Polices : Poppins (telechargee au demarrage), repli sur les polices systeme ---
+DOSSIER_POLICES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+POLICES_URLS = {
+    "Poppins-ExtraBold.ttf": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-ExtraBold.ttf",
+    "Poppins-Bold.ttf":      "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Bold.ttf",
+    "Poppins-SemiBold.ttf":  "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-SemiBold.ttf",
+    "Poppins-Medium.ttf":    "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Medium.ttf",
+    "Poppins-Regular.ttf":   "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Regular.ttf",
+}
+_REPLI_SYS = {
+    "ExtraBold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "Bold":      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "SemiBold":  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "Medium":    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "Regular":   "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+}
+
+
+def assurer_polices():
+    """Telecharge Poppins une fois (si absente). Echec silencieux -> repli systeme."""
+    if not PIL_OK:
+        return
+    try:
+        os.makedirs(DOSSIER_POLICES, exist_ok=True)
+    except Exception:
+        return
+    import urllib.request
+    for nom, url in POLICES_URLS.items():
+        chemin = os.path.join(DOSSIER_POLICES, nom)
+        if os.path.exists(chemin):
             continue
-    return ImageFont.load_default()
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                data = r.read()
+            with open(chemin, "wb") as f:
+                f.write(data)
+        except Exception:
+            pass
+
+
+def _police(taille, poids="Regular"):
+    chemin = os.path.join(DOSSIER_POLICES, f"Poppins-{poids}.ttf")
+    if os.path.exists(chemin):
+        try:
+            return ImageFont.truetype(chemin, taille)
+        except Exception:
+            pass
+    try:
+        return ImageFont.truetype(_REPLI_SYS.get(poids, _REPLI_SYS["Regular"]), taille)
+    except Exception:
+        return ImageFont.load_default()
 
 
 def _ajuster(draw, texte, font, maxw):
@@ -501,6 +561,12 @@ def _ajuster(draw, texte, font, maxw):
     while texte and draw.textlength(texte + "…", font=font) > maxw:
         texte = texte[:-1]
     return texte + "…"
+
+
+def _ombre(draw, pos, texte, font, fill, anchor=None, dx=2, dy=3, alpha=170):
+    """Texte avec ombre portee simple (lisibilite sur fond charge)."""
+    draw.text((pos[0] + dx, pos[1] + dy), texte, font=font, fill=(0, 0, 0, alpha), anchor=anchor)
+    draw.text(pos, texte, font=font, fill=fill, anchor=anchor)
 
 
 def _melange(c, rgb, f):
@@ -538,6 +604,24 @@ def _fond_degrade(L, H, c1, c2):
     return base
 
 
+def _voile_gauche(L, H, force=225, fin=0.74):
+    """Voile sombre degradant de gauche (opaque) vers la droite (transparent)."""
+    ov = Image.new("RGBA", (L, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
+    xfin = max(1, int(L * fin))
+    for x in range(L):
+        a = int(force * (1 - x / xfin)) if x < xfin else 0
+        d.line([(x, 0), (x, H)], fill=(8, 10, 12, max(0, min(255, a))))
+    return ov
+
+
+# Couleurs vives par niveau (rendu carte)
+CARTE_COULEURS = {
+    "Commun": (149, 165, 166), "Peu commun": (46, 204, 113), "Rare": (52, 152, 219),
+    "Epique": (155, 89, 182), "Legendaire": (241, 196, 15), "Mythique": (231, 76, 60),
+}
+
+
 def _progression(score):
     """Renvoie (fraction 0..1 vers le palier suivant, score du palier suivant ou None)."""
     idx = 0
@@ -553,16 +637,17 @@ def _progression(score):
 
 
 async def generer_carte(member, infos):
-    """Genere une carte de profil en image (PNG) soignee, renvoie un buffer BytesIO."""
-    score, niveau, _, couleur = niveau_rarete(infos)
-    rgb = (couleur.r, couleur.g, couleur.b)
+    """Genere une carte de profil en image (PNG) premium, renvoie un buffer BytesIO."""
+    score, niveau, _, _ = niveau_rarete(infos)
+    rgb = CARTE_COULEURS.get(niveau, (149, 165, 166))
     L = 900
 
-    f_nom = _police(54, gras=True)
-    f_id = _police(24)
-    f_pill = _police(26, gras=True)
-    f_pet = _police(22)
-    f_chip = _police(22)
+    f_nom = _police(58, "ExtraBold")
+    f_id = _police(24, "Medium")
+    f_pill = _police(27, "SemiBold")
+    f_pet = _police(22, "Medium")
+    f_chip = _police(23, "SemiBold")
+    blanc, gris = (255, 255, 255, 255), (202, 207, 214, 255)
 
     # Attributs -> pastilles
     cles = list(infos["badges"]) + list(infos["pseudo"])
@@ -571,9 +656,9 @@ async def generer_carte(member, infos):
             cles.append(extra)
     labels = [SET_ITEMS[k]["label"] for k in cles] or ["Compte standard"]
 
-    # Mesure prealable pour calculer le nombre de lignes de pastilles -> hauteur
+    # Mesure prealable -> hauteur dynamique
     mes = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-    pad, gap, ch = 18, 12, 38
+    pad, gap, ch = 20, 12, 42
     x_chip, maxx = 55, L - 45
     chip_w = [mes.textlength(lab, font=f_chip) + pad * 2 for lab in labels]
     cur, rows = x_chip, 1
@@ -582,33 +667,43 @@ async def generer_carte(member, infos):
             rows += 1
             cur = x_chip
         cur += w + gap
-    cy0 = 388
-    H = cy0 + rows * ch + (rows - 1) * gap + 22
+    cy0 = 392
+    H = cy0 + rows * ch + (rows - 1) * gap + 24
 
-    # --- Fond : 1) fond personnalise  2) banniere du compte  3) degrade ---
-    carte = _fond_degrade(L, H, _melange((40, 42, 50), rgb, 0.10), (18, 19, 22))
-    fond_pose = False
+    # --- Fond : 1) perso  2) banniere  3) degrade ---
+    carte = _fond_degrade(L, H, _melange((38, 40, 48), rgb, 0.12), (16, 17, 20))
+    image_fond = False
     if FOND_DATA:
         try:
             img = Image.open(BytesIO(FOND_DATA)).convert("RGBA")
-            carte = Image.alpha_composite(_couvrir(img, L, H), Image.new("RGBA", (L, H), (0, 0, 0, 135)))
-            fond_pose = True
+            carte = _couvrir(img, L, H)
+            image_fond = True
         except Exception:
             pass
-    if not fond_pose:
+    if not image_fond:
         u = await recuperer_user(member)
         if u and u.banner:
             try:
                 bdata = await u.banner.replace(size=600, static_format="png").read()
-                ban = Image.open(BytesIO(bdata)).convert("RGBA").resize((L, H)).filter(ImageFilter.GaussianBlur(14))
-                carte = Image.alpha_composite(ban, Image.new("RGBA", (L, H), (0, 0, 0, 165)))
+                carte = _couvrir(Image.open(BytesIO(bdata)).convert("RGBA"), L, H).filter(ImageFilter.GaussianBlur(8))
+                image_fond = True
             except Exception:
                 pass
+
+    # Assombrissement + voile gauche pour la lisibilite (seulement si image de fond)
+    if image_fond:
+        carte = Image.alpha_composite(carte, Image.new("RGBA", (L, H), (0, 0, 0, 70)))
+        carte = Image.alpha_composite(carte, _voile_gauche(L, H))
+
+    # --- Lueur autour de l'avatar ---
+    ax, ay, ad, ring = 55, 128, 205, 6
+    glow = Image.new("RGBA", (L, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([ax - ring - 22, ay - ring - 22, ax + ad + ring + 22, ay + ad + ring + 22],
+                                 fill=rgb + (135,))
+    carte = Image.alpha_composite(carte, glow.filter(ImageFilter.GaussianBlur(20)))
     draw = ImageDraw.Draw(carte)
-    blanc, gris, fonce = (255, 255, 255, 255), (181, 186, 193, 255), (46, 48, 56, 255)
 
     # --- Avatar + anneau ---
-    ax, ay, ad, ring = 55, 130, 200, 7
     draw.ellipse([ax - ring, ay - ring, ax + ad + ring, ay + ad + ring], fill=rgb + (255,))
     try:
         adata = await member.display_avatar.replace(size=256, static_format="png").read()
@@ -617,42 +712,49 @@ async def generer_carte(member, infos):
         ImageDraw.Draw(m).ellipse([0, 0, ad, ad], fill=255)
         carte.paste(av, (ax, ay), m)
     except Exception:
-        draw.ellipse([ax, ay, ax + ad, ay + ad], fill=fonce)
+        draw.ellipse([ax, ay, ax + ad, ay + ad], fill=(40, 42, 50, 255))
 
     x = 300
     maxw = L - x - 45
-    draw.text((x, 120), _ajuster(draw, member.name, f_nom, maxw), font=f_nom, fill=blanc)
-    draw.text((x, 188), f"ID {member.id}", font=f_id, fill=gris)
+    _ombre(draw, (x, 116), _ajuster(draw, member.name, f_nom, maxw), f_nom, blanc, dx=2, dy=3, alpha=170)
+    _ombre(draw, (x, 188), f"ID  {member.id}", f_id, gris, dx=1, dy=2, alpha=150)
 
-    # Pastille de niveau
+    # --- Pastille de niveau (avec ombre floue) ---
     txt = f"{niveau.upper()}   {score} PTS"
     tw = draw.textlength(txt, font=f_pill)
-    py = 232
-    draw.rounded_rectangle([x, py, x + tw + 44, py + 48], radius=24, fill=rgb + (255,))
-    draw.text((x + 22, py + 24), txt, font=f_pill, fill=(18, 18, 20, 255), anchor="lm")
+    py, pillw = 228, tw + 48
+    sh = Image.new("RGBA", (L, H), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).rounded_rectangle([x, py + 5, x + pillw, py + 55], radius=26, fill=(0, 0, 0, 120))
+    carte = Image.alpha_composite(carte, sh.filter(ImageFilter.GaussianBlur(6)))
+    draw = ImageDraw.Draw(carte)
+    draw.rounded_rectangle([x, py, x + pillw, py + 50], radius=25, fill=rgb + (255,))
+    draw.text((x + 24, py + 25), txt, font=f_pill, fill=(12, 14, 16, 255), anchor="lm")
 
-    # Barre de progression
+    # --- Barre de progression ---
     frac, nxt = _progression(score)
-    bx, by, bw, bh = x, 312, maxw, 20
-    draw.rounded_rectangle([bx, by, bx + bw, by + bh], radius=bh // 2, fill=fonce)
+    bx, by, bw, bh = x, 308, maxw, 22
+    draw.rounded_rectangle([bx, by, bx + bw, by + bh], radius=bh // 2, fill=(255, 255, 255, 45))
     if frac > 0:
         draw.rounded_rectangle([bx, by, bx + max(bh, int(bw * frac)), by + bh], radius=bh // 2, fill=rgb + (255,))
-    label = f"{score} pts → {nxt} pts pour le palier suivant" if nxt else "Palier maximum atteint"
-    draw.text((bx, by + bh + 14), label, font=f_pet, fill=gris, anchor="lt")
+    label = f"Plus que {nxt - score} pts pour le palier suivant" if nxt else "Palier maximum atteint"
+    _ombre(draw, (bx, by + bh + 12), label, f_pet, gris, dx=1, dy=2, alpha=150)
 
-    # Pastilles d'attributs (multi-lignes)
+    # --- Pastilles d'attributs (translucides, multi-lignes) ---
     cxx, cyy = x_chip, cy0
     for lab, w in zip(labels, chip_w):
         if cxx + w > maxx and cxx > x_chip:
             cxx, cyy = x_chip, cyy + ch + gap
-        draw.rounded_rectangle([cxx, cyy, cxx + w, cyy + ch], radius=ch // 2,
-                               fill=fonce, outline=rgb + (255,), width=2)
-        draw.text((cxx + pad, cyy + ch // 2), lab, font=f_chip, fill=(225, 227, 230, 255), anchor="lm")
+        couche = Image.new("RGBA", (L, H), (0, 0, 0, 0))
+        ImageDraw.Draw(couche).rounded_rectangle([cxx, cyy, cxx + w, cyy + ch], radius=ch // 2, fill=(10, 12, 14, 165))
+        carte = Image.alpha_composite(carte, couche)
+        draw = ImageDraw.Draw(carte)
+        draw.rounded_rectangle([cxx, cyy, cxx + w, cyy + ch], radius=ch // 2, outline=rgb + (255,), width=2)
+        draw.text((cxx + pad, cyy + ch // 2), lab, font=f_chip, fill=(236, 238, 241, 255), anchor="lm")
         cxx += w + gap
 
-    # Coins arrondis
+    # --- Coins arrondis ---
     masque = Image.new("L", (L, H), 0)
-    ImageDraw.Draw(masque).rounded_rectangle([0, 0, L - 1, H - 1], radius=34, fill=255)
+    ImageDraw.Draw(masque).rounded_rectangle([0, 0, L - 1, H - 1], radius=36, fill=255)
     final = Image.new("RGBA", (L, H), (0, 0, 0, 0))
     final.paste(carte, (0, 0), masque)
 
@@ -969,6 +1071,12 @@ HELP_CATEGORIES = {
         ("!owner @membre", "Ajoute un owner (buyer)."),
         ("!unowner @membre", "Retire un owner (buyer)."),
         ("!owners", "Buyer + owners."),
+    ],
+    "🛠️ Moderation": [
+        ("!nuke", "Supprime et recree le salon a l'identique (renew)."),
+        ("!clear [n|@membre]", "Purge : 100 derniers, un nombre (1-100), ou les messages d'un membre."),
+        ("!allow [#salon]", "Ouvre un salon aux commandes publiques."),
+        ("!unallow [#salon]", "Referme un salon (owners seulement)."),
     ],
 }
 
@@ -1330,7 +1438,7 @@ async def scan(ctx):
 
 
 @bot.command(name="profil", aliases=["check"])
-@check_owner()
+@check_public()
 async def profil(ctx, member: discord.Member = None):
     member = member or ctx.author
     infos = collecter_infos(member)
@@ -1342,7 +1450,7 @@ async def profil(ctx, member: discord.Member = None):
 
 
 @bot.command(name="carte", aliases=["card"])
-@check_owner()
+@check_public()
 async def carte(ctx, member: discord.Member = None):
     """Genere une carte de profil en image. Ex: !carte @membre"""
     if not PIL_OK:
@@ -1356,13 +1464,13 @@ async def carte(ctx, member: discord.Member = None):
 
 
 @bot.command(name="list")
-@check_owner()
+@check_public()
 async def list_cmd(ctx):
     await ctx.send(embed=embed_list_accueil(), view=ListRootView(ctx.author, ctx.guild))
 
 
 @bot.command(name="top")
-@check_owner()
+@check_public()
 async def top(ctx):
     classement = []
     for m in ctx.guild.members:
@@ -1385,7 +1493,7 @@ async def top(ctx):
 
 
 @bot.command(name="stats")
-@check_owner()
+@check_public()
 async def stats(ctx):
     compteur = {k: 0 for k in DETECT_KEYS}
     niveaux_count = {n: 0 for _, n, _, _ in NIVEAUX}
@@ -1423,9 +1531,114 @@ async def stats(ctx):
 
 
 @bot.command(name="bareme")
-@check_owner()
+@check_public()
 async def bareme(ctx):
     await ctx.send(embed=embed_bareme_accueil(), view=BaremeView(ctx.author, ctx.guild))
+
+
+# ==============================================================================
+#  MODERATION / SALONS
+# ==============================================================================
+
+@bot.command(name="nuke", aliases=["renew"])
+@check_owner()
+async def nuke(ctx):
+    """Supprime le salon et le recree a l'identique (renew)."""
+    salon = ctx.channel
+    if not isinstance(salon, discord.TextChannel):
+        await ctx.send("Cette commande s'utilise dans un salon textuel."); return
+    me = ctx.guild.me
+    if not salon.permissions_for(me).manage_channels:
+        await ctx.send("⛔ Il me manque la permission **Gerer les salons**."); return
+    pos = salon.position
+    try:
+        nouveau = await salon.clone(reason=f"Nuke par {ctx.author}")
+        await nouveau.edit(position=pos)
+        await salon.delete(reason=f"Nuke par {ctx.author}")
+    except discord.Forbidden:
+        await ctx.send("⛔ Permissions insuffisantes pour recreer le salon."); return
+    except discord.HTTPException as e:
+        await ctx.send(f"Erreur : {e}"); return
+    embed = discord.Embed(
+        title="💥 Salon renouvele",
+        description=f"Ce salon a ete nettoye et recree par {ctx.author.mention}.",
+        color=discord.Color.orange(),
+    )
+    try:
+        await nouveau.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+@bot.command(name="clear", aliases=["purge", "clean"])
+@check_owner()
+async def clear(ctx, cible: str = None):
+    """!clear (100 derniers) · !clear <1-100> · !clear @membre (ses 100 derniers messages)."""
+    salon = ctx.channel
+    if not salon.permissions_for(ctx.guild.me).manage_messages:
+        await ctx.send("⛔ Il me manque la permission **Gerer les messages**."); return
+
+    membre = None
+    nombre = None
+    if cible is not None:
+        try:
+            membre = await commands.MemberConverter().convert(ctx, cible)
+        except Exception:
+            try:
+                nombre = max(1, min(100, int(cible)))
+            except ValueError:
+                await ctx.send("Usage : `!clear`, `!clear <1-100>` ou `!clear @membre`."); return
+
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
+    try:
+        if membre is not None:
+            supprimes = await salon.purge(limit=100, check=lambda m: m.author.id == membre.id)
+            txt = f"🧹 {len(supprimes)} message(s) de {membre.mention} supprime(s)."
+        else:
+            n = nombre if nombre is not None else 100
+            supprimes = await salon.purge(limit=n)
+            txt = f"🧹 {len(supprimes)} message(s) supprime(s)."
+    except discord.Forbidden:
+        await ctx.send("⛔ Permissions insuffisantes."); return
+    except discord.HTTPException as e:
+        await ctx.send(f"Erreur : {e}"); return
+
+    await ctx.send(txt, delete_after=4)
+
+
+@bot.command(name="allow")
+@check_owner()
+async def allow(ctx, salon: discord.TextChannel = None):
+    """Autorise les commandes publiques dans un salon. !allow ou !allow #salon."""
+    salon = salon or ctx.channel
+    ajouter_salon_public(salon.id)
+    embed = discord.Embed(
+        title="✅ Salon ouvert aux commandes",
+        description=("Tout le monde peut desormais utiliser les commandes publiques ici :\n"
+                     "`!profil` · `!carte` · `!bareme` · `!top` · `!list` · `!stats`\n\n"
+                     "Les commandes de gestion restent reservees aux owners."),
+        color=discord.Color.green(),
+    )
+    try:
+        await salon.send(embed=embed)
+    except discord.HTTPException:
+        pass
+    if salon.id != ctx.channel.id:
+        await ctx.send(f"✅ Commandes publiques activees dans {salon.mention}.")
+
+
+@bot.command(name="unallow", aliases=["disallow"])
+@check_owner()
+async def unallow(ctx, salon: discord.TextChannel = None):
+    """Retire l'autorisation des commandes publiques. !unallow ou !unallow #salon."""
+    salon = salon or ctx.channel
+    retirer_salon_public(salon.id)
+    await ctx.send(f"🚫 Commandes publiques desactivees dans {salon.mention}. "
+                   "Seuls les owners peuvent y faire des commandes.")
 
 
 @bot.command(name="owner")
@@ -1520,4 +1733,5 @@ async def on_user_update(before, after):
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "COLLE_TON_TOKEN_ICI_SI_TU_VEUX":
         raise SystemExit("Aucun token. Definis DISCORD_TOKEN ou colle-le dans TOKEN.")
+    assurer_polices()   # telecharge Poppins une fois (repli sur police systeme si echec)
     bot.run(TOKEN)
