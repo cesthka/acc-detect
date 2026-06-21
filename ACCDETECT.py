@@ -104,24 +104,29 @@ DEFAULT_EMOJIS = {
 
 JOIN_TITRE_DEFAUT = "🌟 Un compte rare a rejoint le serveur !"
 
-# --- Bareme de rarete ---
+# --- Bareme de rarete (revu) ---
 POIDS = {
-    "staff": 8, "partner": 6, "botdev": 5, "bughunter2": 5, "mod": 4, "bughunter": 4,
+    # Badges (du plus prestigieux au plus commun)
+    "staff": 10, "partner": 8, "botdev": 6, "bughunter2": 6, "mod": 5, "bughunter": 4,
     "hypesquad": 3, "early": 3, "bravery": 1, "brilliance": 1, "balance": 1,
-    "og2016": 4, "og2017": 3, "og2018": 2,
-    "pseudo2": 4, "pseudo3": 3, "mot": 2, "chiffres": 1,
+    # Anciennete
+    "og2016": 5, "og2017": 3, "og2018": 2,
+    # Pseudo
+    "pseudo2": 5, "pseudo3": 3, "mot": 2, "chiffres": 1,
+    # Nitro / Boost (bonus, faible poids)
     "nitro": 1,
     "boost1": 1, "boost2": 1, "boost3": 2, "boost6": 2, "boost9": 3,
     "boost12": 3, "boost15": 4, "boost18": 4, "boost24": 5,
 }
 
+# Paliers : (score minimum, nom, emoji, couleur)
 NIVEAUX = [
-    (0,  "Commun",      discord.Color.light_grey()),
-    (2,  "Peu commun",  discord.Color.green()),
-    (4,  "Rare",        discord.Color.blue()),
-    (7,  "Epique",      discord.Color.purple()),
-    (11, "Legendaire",  discord.Color.gold()),
-    (16, "Mythique",    discord.Color.red()),
+    (0,  "Commun",      "⚪", discord.Color.light_grey()),
+    (2,  "Peu commun",  "🟢", discord.Color.green()),
+    (5,  "Rare",        "🔵", discord.Color.blue()),
+    (9,  "Epique",      "🟣", discord.Color.purple()),
+    (14, "Legendaire",  "🟡", discord.Color.gold()),
+    (20, "Mythique",    "🔴", discord.Color.red()),
 ]
 
 # ==============================================================================
@@ -299,13 +304,16 @@ def detecter_boost(member):
 
 
 def detecter_nitro_probable(member):
-    """Indices de Nitro lisibles par un bot (pas le palier exact)."""
-    try:
-        if member.display_avatar and member.display_avatar.is_animated():
-            return True
-    except Exception:
-        pass
-    if getattr(member, "avatar_decoration", None):
+    """Indices RAPIDES de Nitro (sans appel reseau) : avatar anime ou decoration."""
+    for av in (getattr(member, "avatar", None),
+               getattr(member, "guild_avatar", None),
+               getattr(member, "display_avatar", None)):
+        try:
+            if av and av.is_animated():
+                return True
+        except Exception:
+            pass
+    if getattr(member, "avatar_decoration", None) or getattr(member, "avatar_decoration_data", None):
         return True
     return False
 
@@ -319,6 +327,18 @@ def collecter_infos(member):
         "nitro": detecter_nitro_probable(member),
         "erreurs": [],
     }
+
+
+async def enrichir_nitro(member, infos):
+    """Affine la detection Nitro avec la BANNIERE (signe Nitro fiable), via un fetch.
+    Renvoie l'utilisateur complet (pour reutiliser la banniere dans l'embed)."""
+    try:
+        u = await bot.fetch_user(member.id)
+    except Exception:
+        return None
+    if not infos["nitro"] and (u.banner or getattr(u, "avatar_decoration", None)):
+        infos["nitro"] = True
+    return u
 
 
 OG_THRESHOLDS = dict(OG_SEUILS)
@@ -341,8 +361,7 @@ def membres_avec(guild, key):
     return [m for m in guild.members if not m.bot and membre_a_cle(m, key)]
 
 
-async def appliquer_roles(member):
-    infos = collecter_infos(member)
+async def attribuer_roles_depuis(member, infos):
     cles = list(infos["badges"]) + list(infos["pseudo"])
     for extra in (infos["anciennete"], infos["boost"]):
         if extra:
@@ -359,6 +378,11 @@ async def appliquer_roles(member):
             infos["erreurs"].append("Permission 'Gerer les roles' manquante, ou role du bot trop bas.")
         except discord.HTTPException as e:
             infos["erreurs"].append(f"Erreur API : {e}")
+
+
+async def appliquer_roles(member):
+    infos = collecter_infos(member)
+    await attribuer_roles_depuis(member, infos)
     return infos
 
 
@@ -384,15 +408,15 @@ def score_rarete(infos):
 
 def niveau_rarete(infos):
     s = score_rarete(infos)
-    nom, couleur = NIVEAUX[0][1], NIVEAUX[0][2]
-    for seuil, n, c in NIVEAUX:
+    nom, emo, couleur = NIVEAUX[0][1], NIVEAUX[0][2], NIVEAUX[0][3]
+    for seuil, n, e, c in NIVEAUX:
         if s >= seuil:
-            nom, couleur = n, c
-    return s, nom, couleur
+            nom, emo, couleur = n, e, c
+    return s, nom, emo, couleur
 
 
 def exceptionnel(infos):
-    _, niveau, _ = niveau_rarete(infos)
+    _, niveau, _, _ = niveau_rarete(infos)
     if niveau in ("Legendaire", "Mythique"):
         return True
     return any(b in infos["badges"] for b in ("staff", "partner", "bughunter2"))
@@ -403,7 +427,7 @@ def exceptionnel(infos):
 # ==============================================================================
 
 def embed_profil(member, infos, titre):
-    score, niveau, couleur = niveau_rarete(infos)
+    score, niveau, emo, couleur = niveau_rarete(infos)
     maintenant = datetime.datetime.now(datetime.timezone.utc)
     age = maintenant - member.created_at
     annees, jours = age.days // 365, age.days % 365
@@ -412,7 +436,7 @@ def embed_profil(member, infos, titre):
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Utilisateur", value=f"{member.mention}\n`{member.name}`", inline=True)
     embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
-    embed.add_field(name="💎 Niveau", value=f"**{niveau}** ({score} pts)", inline=True)
+    embed.add_field(name="💎 Niveau", value=f"{emo} **{niveau}** ({score} pts)", inline=True)
     embed.add_field(name="📅 Compte cree",
                     value=f"<t:{int(member.created_at.timestamp())}:D>\n(il y a {annees} an(s) et {jours} j)",
                     inline=True)
@@ -434,22 +458,14 @@ def embed_profil(member, infos, titre):
     return embed
 
 
-async def ajouter_banniere(embed, member):
-    try:
-        u = await bot.fetch_user(member.id)
-        if u.banner:
-            embed.set_image(url=u.banner.url)
-    except Exception:
-        pass
-
-
-async def envoyer_log_join(guild, member, infos):
+async def envoyer_log_join(guild, member, infos, user=None):
     salon = guild.get_channel(CONFIG.get("logs", 0))
     if salon is None:
         return
     embed = embed_profil(member, infos, message_de("join", JOIN_TITRE_DEFAUT))
     embed.set_footer(text=guild.name)
-    await ajouter_banniere(embed, member)
+    if user and user.banner:
+        embed.set_image(url=user.banner.url)
     content = None
     if exceptionnel(infos):
         rid = CONFIG.get("alertrole", 0)
@@ -865,7 +881,7 @@ def embed_bareme_accueil():
                       description="Choisis une categorie pour voir les points.",
                       color=discord.Color.blurple())
     e.add_field(name="Niveaux (score minimum)",
-                value="\n".join(f"{n} : {s}+ pts" for s, n, _ in NIVEAUX), inline=False)
+                value="\n".join(f"{e} {n} : {s}+ pts" for s, n, e, _ in NIVEAUX), inline=False)
     return e
 
 
@@ -1094,8 +1110,10 @@ async def scan(ctx):
 async def profil(ctx, member: discord.Member = None):
     member = member or ctx.author
     infos = collecter_infos(member)
+    u = await enrichir_nitro(member, infos)   # affine le Nitro via la banniere
     embed = embed_profil(member, infos, f"🔎 Profil de {member.name}")
-    await ajouter_banniere(embed, member)
+    if u and u.banner:
+        embed.set_image(url=u.banner.url)
     await ctx.send(embed=embed)
 
 
@@ -1113,13 +1131,17 @@ async def top(ctx):
         if m.bot:
             continue
         infos = collecter_infos(m)
-        s, niv, _ = niveau_rarete(infos)
+        s, niv, emo, _ = niveau_rarete(infos)
         if s > 0:
-            classement.append((s, niv, m))
+            classement.append((s, niv, emo, m))
     classement.sort(key=lambda x: x[0], reverse=True)
     if not classement:
         await ctx.send("Aucun compte rare trouve."); return
-    lignes = [f"**{i}.** {m.mention} — {niv} ({s} pts)" for i, (s, niv, m) in enumerate(classement, 1)]
+    medailles = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lignes = []
+    for i, (s, niv, emo, m) in enumerate(classement, 1):
+        rang = medailles.get(i, f"**{i}.**")
+        lignes.append(f"{rang} {m.mention} — {emo} {niv} ({s} pts)")
     view = PageView(ctx.author, ctx.guild, "🏆 Classement des comptes rares", lignes, discord.Color.gold())
     await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
 
@@ -1128,7 +1150,7 @@ async def top(ctx):
 @check_owner()
 async def stats(ctx):
     compteur = {k: 0 for k in DETECT_KEYS}
-    niveaux_count = {n: 0 for _, n, _ in NIVEAUX}
+    niveaux_count = {n: 0 for _, n, _, _ in NIVEAUX}
     total_rares = 0
     membres = [m for m in ctx.guild.members if not m.bot]
     for m in membres:
@@ -1144,14 +1166,14 @@ async def stats(ctx):
                 compteur[extra] += 1
         if infos["nitro"]:
             compteur["nitro"] += 1
-        _, niv, _ = niveau_rarete(infos)
+        _, niv, _, _ = niveau_rarete(infos)
         niveaux_count[niv] += 1
 
     embed = discord.Embed(title="📊 Statistiques du serveur", color=discord.Color.blurple())
     embed.add_field(name="Vue d'ensemble",
                     value=f"{len(membres)} membres · **{total_rares}** comptes notables", inline=False)
     embed.add_field(name="Niveaux",
-                    value="\n".join(f"{n} : {niveaux_count[n]}" for _, n, _ in NIVEAUX), inline=True)
+                    value="\n".join(f"{e} {n} : {niveaux_count[n]}" for _, n, e, _ in NIVEAUX), inline=True)
     badges_txt = "\n".join(f"{emoji_de(k)} {SET_ITEMS[k]['label']} : {compteur[k]}"
                            for k in CATEGORIES["🏅 Badges"] if compteur[k]) or "—"
     embed.add_field(name="Badges", value=badges_txt, inline=True)
@@ -1236,9 +1258,11 @@ async def on_ready():
 async def on_member_join(member):
     if member.bot:
         return
-    infos = await appliquer_roles(member)
+    infos = collecter_infos(member)
+    u = await enrichir_nitro(member, infos)          # Nitro affine via la banniere
+    await attribuer_roles_depuis(member, infos)      # attribue les roles (nitro inclus)
     if est_notable(infos):
-        await envoyer_log_join(member.guild, member, infos)
+        await envoyer_log_join(member.guild, member, infos, u)
 
 
 @bot.event
