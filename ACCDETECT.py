@@ -15,6 +15,7 @@ import sqlite3
 import math
 import random
 import colorsys
+import asyncio
 from io import BytesIO
 import aiohttp
 import discord
@@ -1724,9 +1725,7 @@ HELP_CATEGORIES = {
         ("!bareme", "Bareme de rarete (menu par categorie)."),
     ],
     "🎨 Personnalisation": [
-        ("!setbio <texte>", "Ta phrase affichee sur ta carte (`reset` pour enlever)."),
-        ("!setcouleur #hex", "Ta couleur d'accent sur ta carte (`reset` pour enlever)."),
-        ("!setfondperso <url|image>", "Ton fond de carte perso (`reset` pour enlever)."),
+        ("!carte → Modifier", "Sous ta propre carte, le bouton Modifier change couleur / fond / description."),
     ],
     "⚙️ Configuration": [
         ("!set", "Panneau interactif (roles, salons, alertes)."),
@@ -2102,66 +2101,6 @@ async def setfond(ctx, url: str = None):
                    file=apercu)
 
 
-@bot.command(name="setbio", aliases=["bio"])
-@check_public()
-async def setbio(ctx, *, texte: str = None):
-    """Definit ta phrase de presentation affichee sur ta carte. `!setbio` seul pour l'enlever."""
-    if texte is None or texte.lower() in ("reset", "clear", "off", "none"):
-        definir_bio(ctx.author.id, None)
-        await ctx.send("🗑️ Ta bio a ete retiree de ta carte.")
-        return
-    texte = " ".join(texte.split())[:120]
-    definir_bio(ctx.author.id, texte)
-    await ctx.send(f"✅ Bio enregistree : « {texte} »\nFais `!carte` pour la voir.")
-
-
-@bot.command(name="setcouleur", aliases=["setcolor", "couleur"])
-@check_public()
-async def setcouleur(ctx, couleur: str = None):
-    """Definit ta couleur d'accent (hex). Ex: `!setcouleur #9B59B6`. `!setcouleur reset` pour enlever."""
-    if couleur is None or couleur.lower() in ("reset", "clear", "off", "none"):
-        definir_couleur(ctx.author.id, None)
-        await ctx.send("🗑️ Couleur perso retiree (retour a la couleur de rarete).")
-        return
-    h = couleur.lstrip("#")
-    if len(h) != 6 or any(c not in "0123456789abcdefABCDEF" for c in h):
-        await ctx.send("❌ Donne une couleur hex valide, ex: `!setcouleur #9B59B6`.")
-        return
-    definir_couleur(ctx.author.id, "#" + h.upper())
-    apercu = Image.new("RGB", (240, 80), tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)))
-    bf = BytesIO(); apercu.save(bf, format="PNG"); bf.seek(0)
-    await ctx.send(f"✅ Couleur d'accent enregistree : #{h.upper()}\nFais `!carte` pour la voir.",
-                   file=discord.File(bf, filename="couleur.png"))
-
-
-@bot.command(name="setfondperso", aliases=["setfondme", "monfond"])
-@check_public()
-async def setfondperso(ctx, url: str = None):
-    """Definit TON fond de carte perso. Joins une image OU donne une URL. `!setfondperso reset` pour enlever."""
-    if not PIL_OK:
-        await ctx.send("Pillow n'est pas installe."); return
-    if url and url.lower() in ("reset", "clear", "off", "none"):
-        definir_fond_membre(ctx.author.id, None)
-        await ctx.send("🗑️ Ton fond perso a ete retire."); return
-    if ctx.message.attachments:
-        url = ctx.message.attachments[0].url
-    if not url:
-        await ctx.send("Donne une image : `!setfondperso <url>` ou **joins une image**.\nPour enlever : `!setfondperso reset`.")
-        return
-    async with ctx.typing():
-        data = await _telecharger(url)
-        if not data:
-            await ctx.send("❌ Impossible de telecharger cette image."); return
-        try:
-            img = Image.open(BytesIO(data)).convert("RGB")
-        except Exception:
-            await ctx.send("❌ Ce fichier n'est pas une image valide."); return
-        img = _couvrir(img, 900, 560)
-        buf = BytesIO(); img.save(buf, format="JPEG", quality=85)
-        definir_fond_membre(ctx.author.id, buf.getvalue())
-    await ctx.send("✅ Fond perso enregistre ! Fais `!carte` pour voir le rendu.")
-
-
 @bot.command(name="scan")
 @check_owner()
 async def scan(ctx):
@@ -2197,14 +2136,118 @@ def embed_fame(guild):
     return discord.Embed(title="🏆 Classement Fame", description="\n".join(lignes), color=discord.Color.gold())
 
 
-class CarteView(discord.ui.View):
-    """Bouton sous une carte pour ouvrir le classement Fame."""
-    def __init__(self):
-        super().__init__(timeout=300)
+class CouleurModal(discord.ui.Modal, title="Couleur d'accent"):
+    valeur = discord.ui.TextInput(label="Couleur hex", placeholder="#9B59B6   (ou « rien » pour enlever)",
+                                  required=False, max_length=7)
 
-    @discord.ui.button(label="Classement Fame", emoji="🏆", style=discord.ButtonStyle.secondary)
-    async def fame_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(embed=embed_fame(interaction.guild), ephemeral=True)
+    def __init__(self, uid):
+        super().__init__()
+        self.uid = uid
+
+    async def on_submit(self, interaction: discord.Interaction):
+        v = str(self.valeur).strip()
+        if not v or v.lower() == "rien":
+            definir_couleur(self.uid, None)
+            await interaction.response.send_message("🗑️ Couleur retiree (retour a la couleur de rarete).", ephemeral=True)
+            return
+        h = v.lstrip("#")
+        if len(h) != 6 or any(c not in "0123456789abcdefABCDEF" for c in h):
+            await interaction.response.send_message("❌ Couleur invalide. Exemple : #9B59B6", ephemeral=True)
+            return
+        definir_couleur(self.uid, "#" + h.upper())
+        await interaction.response.send_message(f"✅ Couleur enregistree : #{h.upper()}. Refais `!carte`.", ephemeral=True)
+
+
+class BioModal(discord.ui.Modal, title="Description"):
+    valeur = discord.ui.TextInput(label="Ta description", style=discord.TextStyle.paragraph,
+                                  placeholder="Ecris ta phrase (ou « rien » pour enlever)", required=False, max_length=120)
+
+    def __init__(self, uid):
+        super().__init__()
+        self.uid = uid
+
+    async def on_submit(self, interaction: discord.Interaction):
+        v = str(self.valeur).strip()
+        if not v or v.lower() == "rien":
+            definir_bio(self.uid, None)
+            await interaction.response.send_message("🗑️ Description retiree.", ephemeral=True)
+            return
+        definir_bio(self.uid, " ".join(v.split())[:120])
+        await interaction.response.send_message("✅ Description enregistree. Refais `!carte`.", ephemeral=True)
+
+
+class ModifierActionsView(discord.ui.View):
+    """Menu ephemere : choisir quoi modifier sur sa carte."""
+    def __init__(self, uid):
+        super().__init__(timeout=180)
+        self.uid = uid
+
+    @discord.ui.button(label="Couleur", emoji="🎨", style=discord.ButtonStyle.secondary)
+    async def b_couleur(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(CouleurModal(self.uid))
+
+    @discord.ui.button(label="Description", emoji="📝", style=discord.ButtonStyle.secondary)
+    async def b_desc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BioModal(self.uid))
+
+    @discord.ui.button(label="Fond", emoji="🖼️", style=discord.ButtonStyle.secondary)
+    async def b_fond(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not PIL_OK:
+            await interaction.response.send_message("Pillow n'est pas installe.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Envoie ton **image de fond** ici (en piece jointe), ou ecris **rien** pour annuler.\n"
+            "_Ton message sera supprime aussitot pour que personne ne le voie._", ephemeral=True)
+
+        def check(m):
+            return m.author.id == self.uid and m.channel.id == interaction.channel.id
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=120)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⏱️ Temps ecoule, fond non modifie.", ephemeral=True)
+            return
+
+        contenu = (msg.content or "").strip().lower()
+        data = await _telecharger(msg.attachments[0].url) if msg.attachments else None
+        try:
+            await msg.delete()
+            supprime = True
+        except Exception:
+            supprime = False
+
+        if contenu == "rien":
+            await interaction.followup.send("Annule." + ("" if supprime else " (je n'ai pas pu supprimer ton message)"), ephemeral=True)
+            return
+        if not data:
+            await interaction.followup.send("❌ Aucune image valide trouvee. Reessaie via Modifier.", ephemeral=True)
+            return
+        try:
+            img = Image.open(BytesIO(data)).convert("RGB")
+            img = _couvrir(img, 900, 560)
+            buf = BytesIO(); img.save(buf, format="JPEG", quality=85)
+            definir_fond_membre(self.uid, buf.getvalue())
+        except Exception:
+            await interaction.followup.send("❌ Ce fichier n'est pas une image valide.", ephemeral=True)
+            return
+        rep = "✅ Fond enregistre ! Refais `!carte`."
+        if not supprime:
+            rep += "\n⚠️ Je n'ai pas pu supprimer ton message (permission « Gerer les messages » manquante)."
+        await interaction.followup.send(rep, ephemeral=True)
+
+
+class CarteModifierView(discord.ui.View):
+    """Bouton 'Modifier' sous sa propre carte."""
+    def __init__(self, owner_id):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+
+    @discord.ui.button(label="Modifier", emoji="✏️", style=discord.ButtonStyle.secondary)
+    async def b_modifier(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Tu ne peux modifier que ta propre carte.", ephemeral=True)
+            return
+        await interaction.response.send_message("Que veux-tu modifier ?", view=ModifierActionsView(self.owner_id), ephemeral=True)
 
 
 @bot.command(name="profil", aliases=["check"])
@@ -2218,7 +2261,7 @@ async def profil(ctx, member: discord.Member = None):
     embed.add_field(name="👁 Fame", value=f"{vues} vue(s)", inline=True)
     if u and u.banner:
         embed.set_image(url=u.banner.url)
-    await ctx.send(embed=embed, view=CarteView())
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="carte", aliases=["card"])
@@ -2236,8 +2279,9 @@ async def carte(ctx, member: discord.Member = None):
     accent = couleur_membre(member.id)
     async with ctx.typing():
         buf, ext = await generer_carte(member, infos, vues, rang, bio, accent)
+    vue = CarteModifierView(member.id) if member.id == ctx.author.id else None
     await ctx.send(content=f"👁 **{vues}** vue(s)",
-                   file=discord.File(buf, filename=f"carte.{ext}"), view=CarteView())
+                   file=discord.File(buf, filename=f"carte.{ext}"), view=vue)
 
 
 @bot.command(name="tcg", aliases=["tcgcard", "collec", "holo", "anim"])
@@ -2253,7 +2297,7 @@ async def tcg(ctx, member: discord.Member = None):
     async with ctx.typing():
         buf = await generer_carte_tcg_anim(member, infos, vues)
     await ctx.send(content=f"👁 **{vues}** vue(s)",
-                   file=discord.File(buf, filename="carte_tcg.gif"), view=CarteView())
+                   file=discord.File(buf, filename="carte_tcg.gif"))
 
 
 @bot.command(name="list")
@@ -2285,27 +2329,52 @@ async def top(ctx):
     await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
 
 
+class FameView(discord.ui.View):
+    """Menu deroulant : afficher la fame en version Carte ou TCG."""
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.select(placeholder="Choisis l'affichage…", options=[
+        discord.SelectOption(label="Fame Carte", value="carte", emoji="🖼️", description="Classement + carte du n°1"),
+        discord.SelectOption(label="Fame TCG", value="tcg", emoji="🎴", description="Classement + TCG anime du n°1"),
+    ])
+    async def choisir(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await interaction.response.defer()
+        guild = interaction.guild
+        compte = vues_par_profil()
+        classement = []
+        for m in guild.members:
+            if m.bot:
+                continue
+            v = compte.get(m.id, 0)
+            if v > 0:
+                classement.append((v, m))
+        classement.sort(key=lambda x: x[0], reverse=True)
+        embed = embed_fame(guild)
+        if not classement or not PIL_OK:
+            await interaction.followup.send(embed=embed)
+            return
+        top_m = classement[0][1]
+        infos = collecter_infos(top_m)
+        vues = compter_vues(top_m.id)
+        try:
+            if select.values[0] == "carte":
+                buf, ext = await generer_carte(top_m, infos, vues, fame_rang(guild, top_m.id),
+                                               BIOS.get(top_m.id), couleur_membre(top_m.id))
+                fichier = discord.File(buf, filename=f"fame_carte.{ext}")
+            else:
+                buf = await generer_carte_tcg_anim(top_m, infos, vues)
+                fichier = discord.File(buf, filename="fame_tcg.gif")
+            await interaction.followup.send(content=f"👑 **N°1 Fame** : {top_m.mention}", embed=embed, file=fichier)
+        except Exception:
+            await interaction.followup.send(embed=embed)
+
+
 @bot.command(name="fame", aliases=["fames", "celebrite", "vues"])
 @check_public()
 async def fame(ctx):
-    """Classement des profils les plus vus (fame)."""
-    compte = vues_par_profil()
-    classement = []
-    for m in ctx.guild.members:
-        if m.bot:
-            continue
-        v = compte.get(m.id, 0)
-        if v > 0:
-            classement.append((v, m))
-    classement.sort(key=lambda x: x[0], reverse=True)
-    if not classement:
-        await ctx.send("Personne n'a encore de vues. Faites `!carte @membre` pour lancer la fame !")
-        return
-    medailles = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lignes = [f"{medailles.get(i, f'**{i}.**')} {m.mention} — 👁 {v} vue(s)"
-              for i, (v, m) in enumerate(classement, 1)]
-    view = PageView(ctx.author, ctx.guild, "🏆 Classement Fame", lignes, discord.Color.gold())
-    await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
+    """Classement des profils les plus vus (menu Carte / TCG)."""
+    await ctx.send("🏆 **Fame** — choisis l'affichage :", view=FameView())
 
 
 @bot.command(name="stats")
