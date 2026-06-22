@@ -12,6 +12,9 @@ ce serveur (via premium_since).
 import os
 import datetime
 import sqlite3
+import math
+import random
+import colorsys
 from io import BytesIO
 import aiohttp
 import discord
@@ -24,7 +27,7 @@ except ImportError:
     WORDFREQ_OK = False
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
     PIL_OK = True
 except ImportError:
     PIL_OK = False
@@ -765,6 +768,209 @@ async def generer_carte(member, infos):
 
 
 # ==============================================================================
+#  CARTE TCG HOLOGRAPHIQUE
+# ==============================================================================
+
+# Style par palier : couleur, intensite holographique, nombre d'etoiles.
+TIERS_TCG = {
+    "Commun":     {"c": (150, 160, 170), "holo": 0.0,  "et": 1},
+    "Peu commun": {"c": (46, 204, 113),  "holo": 0.0,  "et": 2},
+    "Rare":       {"c": (52, 152, 219),  "holo": 0.13, "et": 3},
+    "Epique":     {"c": (155, 89, 182),  "holo": 0.22, "et": 4},
+    "Legendaire": {"c": (241, 196, 15),  "holo": 0.32, "et": 5},
+    "Mythique":   {"c": (231, 76, 60),   "holo": 0.46, "et": 6},
+}
+
+
+def _tcg_degrade(L, H, c1, c2):
+    base = Image.new("RGB", (L, H))
+    d = ImageDraw.Draw(base)
+    for y in range(H):
+        d.line([(0, y), (L, y)], fill=_melange(c1, c2, y / max(1, H - 1)))
+    return base
+
+
+def _tcg_rainbow(W, H, sat=0.6, periodes=2.2, decalage=0.0, scale=3):
+    w, h = max(1, W // scale), max(1, H // scale)
+    data = bytearray(w * h * 3)
+    N = 360
+    pal = []
+    for i in range(N):
+        r, g, b = colorsys.hsv_to_rgb(i / N, sat, 1.0)
+        pal.append((int(r * 255), int(g * 255), int(b * 255)))
+    maxd = w + h
+    for y in range(h):
+        for x in range(w):
+            hh = int((((x + y) / maxd * periodes + decalage) % 1.0) * N) % N
+            r, g, b = pal[hh]
+            idx = (y * w + x) * 3
+            data[idx] = r; data[idx + 1] = g; data[idx + 2] = b
+    return Image.frombytes("RGB", (w, h), bytes(data)).resize((W, H))
+
+
+def _tcg_stries(W, H, uid, larg=60, n=4):
+    m = Image.new("L", (W, H), 0)
+    d = ImageDraw.Draw(m)
+    rng = random.Random(uid)
+    for _ in range(n):
+        cx = rng.randint(0, int(W * 1.15))
+        val = rng.randint(160, 235)
+        d.polygon([(cx - larg, 0), (cx + larg, 0), (cx + larg - H, H), (cx - larg - H, H)], fill=val)
+    return m.filter(ImageFilter.GaussianBlur(30))
+
+
+def _tcg_paillettes(W, H, uid, box, n):
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    rng = random.Random(uid * 3 + 1)
+    x0, y0, x1, y1 = box
+    for _ in range(n):
+        x = rng.randint(x0, x1); y = rng.randint(y0, y1)
+        r = rng.uniform(1.5, 4.5); a = rng.randint(120, 235)
+        d.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, a))
+        if rng.random() < 0.4:
+            ln = r * rng.uniform(3, 6)
+            d.line([(x - ln, y), (x + ln, y)], fill=(255, 255, 255, a // 2), width=1)
+            d.line([(x, y - ln), (x, y + ln)], fill=(255, 255, 255, a // 2), width=1)
+    return layer.filter(ImageFilter.GaussianBlur(0.6))
+
+
+def _tcg_gloss(W, H, box):
+    x0, y0, x1, y1 = box
+    g = Image.new("L", (x1 - x0, y1 - y0), 0)
+    ImageDraw.Draw(g).polygon([(0, 0), ((x1 - x0) * 0.6, 0), (0, (y1 - y0) * 0.6)], fill=70)
+    g = g.filter(ImageFilter.GaussianBlur(40))
+    full = Image.new("L", (W, H), 0)
+    full.paste(g, (x0, y0))
+    return full
+
+
+def _tcg_etoile(draw, cx, cy, r, fill):
+    pts = []
+    for i in range(10):
+        ang = -math.pi / 2 + i * math.pi / 5
+        rr = r if i % 2 == 0 else r * 0.45
+        pts.append((cx + rr * math.cos(ang), cy + rr * math.sin(ang)))
+    draw.polygon(pts, fill=fill)
+
+
+async def generer_carte_tcg(member, infos):
+    """Genere une carte a collectionner holographique (PNG) -> buffer BytesIO."""
+    score, niveau, _, _ = niveau_rarete(infos)
+    st = TIERS_TCG.get(niveau, TIERS_TCG["Commun"])
+    col = st["c"]
+    uid = member.id
+    W, H = 744, 1040
+    dark = _melange(col, (12, 12, 16), 0.82)
+    mid = _melange(col, (20, 20, 26), 0.6)
+
+    # Avatar
+    try:
+        adata = await member.display_avatar.replace(size=256, static_format="png").read()
+        avatar = Image.open(BytesIO(adata)).convert("RGB")
+    except Exception:
+        avatar = Image.new("RGB", (256, 256), (40, 42, 50))
+
+    # Labels
+    cles = list(infos["badges"]) + list(infos["pseudo"])
+    for extra in (infos["anciennete"], infos["boost"]):
+        if extra:
+            cles.append(extra)
+    labels = [SET_ITEMS[k]["label"] for k in cles] or ["Compte standard"]
+
+    # Fond + cadre metallique
+    carte = _tcg_degrade(W, H, _melange(col, (18, 18, 24), 0.7), (8, 8, 11)).convert("RGBA")
+    draw = ImageDraw.Draw(carte)
+    frame = _tcg_degrade(W, H, _melange(col, (255, 255, 255), 0.4), _melange(col, (0, 0, 0), 0.5)).convert("RGBA")
+    fmask = Image.new("L", (W, H), 0)
+    fd = ImageDraw.Draw(fmask)
+    fd.rounded_rectangle([6, 6, W - 6, H - 6], radius=42, fill=255)
+    fd.rounded_rectangle([30, 30, W - 30, H - 30], radius=32, fill=0)
+    carte.paste(frame, (0, 0), fmask)
+    draw.rounded_rectangle([30, 30, W - 30, H - 30], radius=32, fill=dark)
+
+    M = 46
+    # Plaque nom + gemme score
+    draw.rounded_rectangle([M, 46, W - M, 120], radius=20, fill=_melange(mid, (0, 0, 0), 0.2), outline=col, width=2)
+    fn = _police(40, "ExtraBold")
+    nm = member.name
+    while draw.textlength(nm, font=fn) > W - M - 170 and len(nm) > 1:
+        nm = nm[:-1]
+    if nm != member.name:
+        nm = nm[:-1] + "…"
+    draw.text((M + 22, 83), nm, font=fn, fill=(255, 255, 255), anchor="lm")
+    gx, gy, gr = W - M - 40, 83, 34
+    draw.ellipse([gx - gr - 4, gy - gr - 4, gx + gr + 4, gy + gr + 4], fill=_melange(col, (0, 0, 0), 0.4))
+    draw.ellipse([gx - gr, gy - gr, gx + gr, gy + gr], fill=col, outline=(255, 255, 255), width=3)
+    draw.text((gx, gy), str(score), font=_police(30, "ExtraBold"), fill=(15, 15, 18), anchor="mm")
+
+    # Fenetre illustration
+    ax0, ay0, ax1, ay1 = M, 138, W - M, 612
+    aw, ah = ax1 - ax0, ay1 - ay0
+    art = _couvrir(avatar, aw, ah).convert("RGBA")
+    amask = Image.new("L", (aw, ah), 0)
+    ImageDraw.Draw(amask).rounded_rectangle([0, 0, aw - 1, ah - 1], radius=18, fill=255)
+    carte.paste(art, (ax0, ay0), amask)
+    draw = ImageDraw.Draw(carte)
+    draw.rounded_rectangle([ax0, ay0, ax1, ay1], radius=18, outline=col, width=3)
+
+    # Ligne de type
+    draw.rounded_rectangle([M, 628, W - M, 684], radius=14, fill=_melange(mid, (0, 0, 0), 0.25), outline=col, width=2)
+    draw.text((W // 2, 656), niveau.upper(), font=_police(26, "SemiBold"), fill=(255, 255, 255), anchor="mm")
+
+    # Bloc stats
+    draw.rounded_rectangle([M, 700, W - M, 958], radius=18, fill=_melange((10, 10, 14), col, 0.06), outline=col, width=2)
+    fl = _police(24, "Medium")
+    y = 730
+    for lab in labels[:7]:
+        draw.ellipse([M + 24, y - 6, M + 36, y + 6], fill=col)
+        draw.text((M + 50, y), lab, font=fl, fill=(232, 234, 238), anchor="lm")
+        y += 33
+
+    # Bas : etoiles / serie / score
+    for i in range(st["et"]):
+        _tcg_etoile(draw, M + 24 + i * 30, 1000, 11, col)
+    draw.text((W // 2, 1000), f"N° {int(str(uid)[-4:]):04d}", font=_police(22, "Medium"), fill=(200, 205, 212), anchor="mm")
+    draw.text((W - M - 10, 1000), f"{score} PTS", font=_police(24, "Bold"), fill=col, anchor="rm")
+
+    # --- Holographie ---
+    if st["holo"] > 0:
+        rb = _tcg_rainbow(W, H, decalage=(uid % 100) / 100).convert("RGB")
+        sr = _tcg_stries(W, H, uid)
+        frame_reg = Image.new("L", (W, H), 0)
+        fr = ImageDraw.Draw(frame_reg)
+        fr.rounded_rectangle([6, 6, W - 6, H - 6], radius=42, fill=255)
+        fr.rounded_rectangle([30, 30, W - 30, H - 30], radius=32, fill=0)
+        art_reg = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(art_reg).rounded_rectangle([ax0, ay0, ax1, ay1], radius=18, fill=255)
+        mframe = ImageChops.multiply(frame_reg, sr).point(lambda p: int(min(255, p * st["holo"] * 2.6)))
+        mart = ImageChops.multiply(art_reg, sr).point(lambda p: int(min(255, p * st["holo"] * 1.35)))
+        rgb = carte.convert("RGB")
+        rgb = Image.composite(ImageChops.screen(rgb, rb), rgb, mframe)
+        rgb = Image.composite(ImageChops.overlay(rgb, rb), rgb, mart)
+        carte = rgb.convert("RGBA")
+        # Reflet de verre sur l'illustration
+        gl = ImageChops.multiply(_tcg_gloss(W, H, (ax0, ay0, ax1, ay1)), art_reg)
+        carte = Image.alpha_composite(carte, Image.merge("RGBA", (Image.new("L", (W, H), 255),) * 3 + (gl,)))
+        # Paillettes (paliers eleves)
+        if st["et"] >= 4:
+            pa = _tcg_paillettes(W, H, uid, (ax0, ay0, ax1, ay1), st["et"] * 5)
+            pa = Image.composite(pa, Image.new("RGBA", (W, H), (0, 0, 0, 0)), art_reg)
+            carte = Image.alpha_composite(carte, pa)
+
+    # Coins arrondis
+    out = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(out).rounded_rectangle([0, 0, W - 1, H - 1], radius=44, fill=255)
+    final = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    final.paste(carte, (0, 0), out)
+
+    buf = BytesIO()
+    final.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+# ==============================================================================
 #  VUES
 # ==============================================================================
 
@@ -1052,6 +1258,7 @@ HELP_CATEGORIES = {
         ("!scan", "Lister les membres d'un critere (vers le salon de scan)."),
         ("!profil @membre", "Profil complet d'un membre."),
         ("!carte @membre", "Carte de profil en image (avatar, niveau, badges)."),
+        ("!tcg @membre", "Carte a collectionner holographique (rendu premium)."),
         ("!list", "Liste des membres d'un critere (menu deroulant)."),
         ("!stats", "Tableau de bord global du serveur."),
         ("!top", "Classement des comptes les plus rares."),
@@ -1461,6 +1668,20 @@ async def carte(ctx, member: discord.Member = None):
     async with ctx.typing():
         buf = await generer_carte(member, infos)
     await ctx.send(file=discord.File(buf, filename="profil.png"))
+
+
+@bot.command(name="tcg", aliases=["tcgcard", "collec"])
+@check_public()
+async def tcg(ctx, member: discord.Member = None):
+    """Genere une carte a collectionner holographique. Ex: !tcg @membre"""
+    if not PIL_OK:
+        await ctx.send("La librairie Pillow n'est pas installee (ajoute `Pillow` aux dependances).")
+        return
+    member = member or ctx.author
+    infos = collecter_infos(member)
+    async with ctx.typing():
+        buf = await generer_carte_tcg(member, infos)
+    await ctx.send(file=discord.File(buf, filename="carte_tcg.png"))
 
 
 @bot.command(name="list")
