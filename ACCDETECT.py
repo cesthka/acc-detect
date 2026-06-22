@@ -154,6 +154,8 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS messages (key TEXT PRIMARY KEY, contenu TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS fond     (id INTEGER PRIMARY KEY, data BLOB)")
     conn.execute("CREATE TABLE IF NOT EXISTS salons_public (channel_id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS vues (profil_id INTEGER, viewer_id INTEGER, "
+                 "PRIMARY KEY (profil_id, viewer_id))")
     conn.commit(); conn.close()
 
 
@@ -233,6 +235,31 @@ def ajouter_salon_public(cid):
 def retirer_salon_public(cid):
     conn = db(); conn.execute("DELETE FROM salons_public WHERE channel_id=?", (cid,))
     conn.commit(); conn.close(); SALONS_PUBLIC.discard(cid)
+
+
+def enregistrer_vue(profil_id, viewer_id):
+    """Ajoute une vue unique (viewer -> profil) et renvoie le total de vues du profil."""
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO vues (profil_id, viewer_id) VALUES (?, ?)", (profil_id, viewer_id))
+    conn.commit()
+    n = conn.execute("SELECT COUNT(*) FROM vues WHERE profil_id=?", (profil_id,)).fetchone()[0]
+    conn.close()
+    return n
+
+
+def compter_vues(profil_id):
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM vues WHERE profil_id=?", (profil_id,)).fetchone()[0]
+    conn.close()
+    return n
+
+
+def vues_par_profil():
+    """Renvoie {profil_id: nombre_de_vues} pour tous les profils vus."""
+    conn = db()
+    rows = conn.execute("SELECT profil_id, COUNT(*) FROM vues GROUP BY profil_id").fetchall()
+    conn.close()
+    return dict(rows)
 
 
 init_db()
@@ -639,7 +666,36 @@ def _progression(score):
     return 1.0, None
 
 
-async def generer_carte(member, infos):
+def _oeil(draw, cx, cy, w):
+    """Dessine une petite icone d'oeil (vectorielle)."""
+    h = int(w * 0.66)
+    draw.ellipse([cx - w // 2, cy - h // 2, cx + w // 2, cy + h // 2], fill=(238, 240, 243))
+    ir = int(h * 0.46)
+    draw.ellipse([cx - ir, cy - ir, cx + ir, cy + ir], fill=(64, 96, 168))
+    pp = max(2, int(ir * 0.52))
+    draw.ellipse([cx - pp, cy - pp, cx + pp, cy + pp], fill=(16, 16, 22))
+    rf = max(1, pp // 2)
+    draw.ellipse([cx - pp, cy - pp, cx - pp + rf, cy - pp + rf], fill=(255, 255, 255))
+
+
+def _dessiner_vues(carte, x, y, vues, police, hauteur=42):
+    """Pastille translucide : icone oeil + compteur de vues. Renvoie sa largeur."""
+    d = ImageDraw.Draw(carte)
+    txt = str(vues)
+    ew = int(hauteur * 0.62)
+    tw = d.textlength(txt, font=police)
+    pad = 14
+    largeur = int(pad + ew + 8 + tw + pad)
+    pill = Image.new("RGBA", carte.size, (0, 0, 0, 0))
+    ImageDraw.Draw(pill).rounded_rectangle([x, y, x + largeur, y + hauteur], radius=hauteur // 2, fill=(10, 12, 16, 175))
+    carte.alpha_composite(pill)
+    d = ImageDraw.Draw(carte)
+    _oeil(d, int(x + pad + ew / 2), int(y + hauteur / 2), ew)
+    d.text((x + pad + ew + 8, y + hauteur // 2), txt, font=police, fill=(240, 242, 245), anchor="lm")
+    return largeur
+
+
+async def generer_carte(member, infos, vues=0):
     """Genere une carte de profil en image (PNG) premium, renvoie un buffer BytesIO."""
     score, niveau, _, _ = niveau_rarete(infos)
     rgb = CARTE_COULEURS.get(niveau, (149, 165, 166))
@@ -755,6 +811,11 @@ async def generer_carte(member, infos):
         draw.text((cxx + pad, cyy + ch // 2), lab, font=f_chip, fill=(236, 238, 241, 255), anchor="lm")
         cxx += w + gap
 
+    # --- Pastille de vues (haut-droite) ---
+    fv = _police(24, "SemiBold")
+    largeur_v = int(14 + int(42 * 0.62) + 8 + draw.textlength(str(vues), font=fv) + 14)
+    _dessiner_vues(carte, L - 30 - largeur_v, 28, vues, fv)
+
     # --- Coins arrondis ---
     masque = Image.new("L", (L, H), 0)
     ImageDraw.Draw(masque).rounded_rectangle([0, 0, L - 1, H - 1], radius=36, fill=255)
@@ -854,7 +915,7 @@ def _tcg_etoile(draw, cx, cy, r, fill):
     draw.polygon(pts, fill=fill)
 
 
-async def generer_carte_tcg(member, infos):
+async def generer_carte_tcg(member, infos, vues=0):
     """Genere une carte a collectionner holographique (PNG) -> buffer BytesIO."""
     score, niveau, _, _ = niveau_rarete(infos)
     st = TIERS_TCG.get(niveau, TIERS_TCG["Commun"])
@@ -957,6 +1018,9 @@ async def generer_carte_tcg(member, infos):
             pa = _tcg_paillettes(W, H, uid, (ax0, ay0, ax1, ay1), st["et"] * 5)
             pa = Image.composite(pa, Image.new("RGBA", (W, H), (0, 0, 0, 0)), art_reg)
             carte = Image.alpha_composite(carte, pa)
+
+    # Pastille de vues (coin haut-gauche de l'illustration)
+    _dessiner_vues(carte, ax0 + 14, ay0 + 14, vues, _police(24, "SemiBold"), hauteur=40)
 
     # Coins arrondis
     out = Image.new("L", (W, H), 0)
@@ -1262,6 +1326,7 @@ HELP_CATEGORIES = {
         ("!list", "Liste des membres d'un critere (menu deroulant)."),
         ("!stats", "Tableau de bord global du serveur."),
         ("!top", "Classement des comptes les plus rares."),
+        ("!fame", "Classement des profils les plus vus (vues uniques)."),
         ("!bareme", "Bareme de rarete (menu par categorie)."),
     ],
     "⚙️ Configuration": [
@@ -1644,16 +1709,57 @@ async def scan(ctx):
     await ctx.send(embed=embed_scan_accueil(), view=ScanView(ctx.author, ctx.guild))
 
 
+def comptabiliser_vue(viewer, cible):
+    """Enregistre une vue unique (viewer -> cible) sauf auto-vue/bot. Renvoie le total."""
+    if cible.bot:
+        return compter_vues(cible.id)
+    if viewer.id == cible.id:
+        return compter_vues(cible.id)
+    return enregistrer_vue(cible.id, viewer.id)
+
+
+def embed_fame(guild):
+    compte = vues_par_profil()
+    classement = []
+    for m in guild.members:
+        if m.bot:
+            continue
+        v = compte.get(m.id, 0)
+        if v > 0:
+            classement.append((v, m))
+    classement.sort(key=lambda x: x[0], reverse=True)
+    medailles = {1: "🥇", 2: "🥈", 3: "🥉"}
+    if not classement:
+        return discord.Embed(title="🏆 Classement Fame",
+                             description="Personne n'a encore de vues. Faites `!carte @membre` !",
+                             color=discord.Color.gold())
+    lignes = [f"{medailles.get(i, f'**{i}.**')} {m.mention} — 👁 {v} vue(s)"
+              for i, (v, m) in enumerate(classement[:20], 1)]
+    return discord.Embed(title="🏆 Classement Fame", description="\n".join(lignes), color=discord.Color.gold())
+
+
+class CarteView(discord.ui.View):
+    """Bouton sous une carte pour ouvrir le classement Fame."""
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Classement Fame", emoji="🏆", style=discord.ButtonStyle.secondary)
+    async def fame_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=embed_fame(interaction.guild), ephemeral=True)
+
+
 @bot.command(name="profil", aliases=["check"])
 @check_public()
 async def profil(ctx, member: discord.Member = None):
     member = member or ctx.author
     infos = collecter_infos(member)
+    vues = comptabiliser_vue(ctx.author, member)
     u = await recuperer_user(member)
     embed = embed_profil(member, infos, f"🔎 Profil de {member.name}")
+    embed.add_field(name="👁 Fame", value=f"{vues} vue(s)", inline=True)
     if u and u.banner:
         embed.set_image(url=u.banner.url)
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, view=CarteView())
 
 
 @bot.command(name="carte", aliases=["card"])
@@ -1665,9 +1771,11 @@ async def carte(ctx, member: discord.Member = None):
         return
     member = member or ctx.author
     infos = collecter_infos(member)
+    vues = comptabiliser_vue(ctx.author, member)
     async with ctx.typing():
-        buf = await generer_carte(member, infos)
-    await ctx.send(file=discord.File(buf, filename="profil.png"))
+        buf = await generer_carte(member, infos, vues)
+    await ctx.send(content=f"👁 **{vues}** vue(s)",
+                   file=discord.File(buf, filename="profil.png"), view=CarteView())
 
 
 @bot.command(name="tcg", aliases=["tcgcard", "collec"])
@@ -1679,9 +1787,11 @@ async def tcg(ctx, member: discord.Member = None):
         return
     member = member or ctx.author
     infos = collecter_infos(member)
+    vues = comptabiliser_vue(ctx.author, member)
     async with ctx.typing():
-        buf = await generer_carte_tcg(member, infos)
-    await ctx.send(file=discord.File(buf, filename="carte_tcg.png"))
+        buf = await generer_carte_tcg(member, infos, vues)
+    await ctx.send(content=f"👁 **{vues}** vue(s)",
+                   file=discord.File(buf, filename="carte_tcg.png"), view=CarteView())
 
 
 @bot.command(name="list")
@@ -1713,9 +1823,27 @@ async def top(ctx):
     await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
 
 
-@bot.command(name="stats")
+@bot.command(name="fame", aliases=["fames", "celebrite", "vues"])
 @check_public()
-async def stats(ctx):
+async def fame(ctx):
+    """Classement des profils les plus vus (fame)."""
+    compte = vues_par_profil()
+    classement = []
+    for m in ctx.guild.members:
+        if m.bot:
+            continue
+        v = compte.get(m.id, 0)
+        if v > 0:
+            classement.append((v, m))
+    classement.sort(key=lambda x: x[0], reverse=True)
+    if not classement:
+        await ctx.send("Personne n'a encore de vues. Faites `!carte @membre` pour lancer la fame !")
+        return
+    medailles = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lignes = [f"{medailles.get(i, f'**{i}.**')} {m.mention} — 👁 {v} vue(s)"
+              for i, (v, m) in enumerate(classement, 1)]
+    view = PageView(ctx.author, ctx.guild, "🏆 Classement Fame", lignes, discord.Color.gold())
+    await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
     compteur = {k: 0 for k in DETECT_KEYS}
     niveaux_count = {n: 0 for _, n, _, _ in NIVEAUX}
     total_rares = 0
