@@ -773,41 +773,101 @@ def _dessiner_vues(carte, x, y, vues, police, hauteur=42):
     return largeur
 
 
+def _gif_en_frames(data, max_frames=30):
+    """Decoupe des bytes GIF/anime en frames RGB en composant correctement les frames."""
+    try:
+        im = Image.open(BytesIO(data))
+    except Exception:
+        return []
+    try:
+        n = int(getattr(im, "n_frames", 1) or 1)
+    except Exception:
+        n = 1
+    if n <= 1:
+        try:
+            return [im.convert("RGB")]
+        except Exception:
+            return []
+    voulues = set([int(i * n / max_frames) for i in range(max_frames)] if n > max_frames else range(n))
+    frames, canvas = [], None
+    try:
+        for idx in range(n):
+            im.seek(idx)
+            cur = im.convert("RGBA")
+            canvas = cur if canvas is None else Image.alpha_composite(canvas, cur)
+            if idx in voulues:
+                frames.append(canvas.convert("RGB"))
+    except Exception:
+        pass
+    if not frames:
+        try:
+            im.seek(0)
+            frames = [im.convert("RGB")]
+        except Exception:
+            frames = []
+    return frames
+
+
+async def _lire_asset(asset):
+    """Lit un asset Discord en bytes, avec repli direct (aiohttp) sur son URL."""
+    try:
+        data = await asset.read()
+        if data:
+            return data
+    except Exception:
+        pass
+    try:
+        return await _telecharger(str(asset.url))
+    except Exception:
+        return None
+
+
 async def _charger_frames_avatar(member, taille=256, max_frames=30):
-    """Renvoie (frames RGB, est_anime). Gere les avatars GIF animes."""
+    """Renvoie (frames RGB, est_anime). Avatars GIF animes geres, avec replis robustes."""
     av = member.display_avatar
     try:
-        anime = av.is_animated()
+        anime = bool(av.is_animated())
     except Exception:
         anime = False
+
     if anime:
-        try:
-            data = await av.replace(size=taille, format="gif").read()
-            gif = Image.open(BytesIO(data))
+        for variante in (
+            lambda: av.replace(size=taille, format="gif"),
+            lambda: av.with_size(taille).with_format("gif"),
+            lambda: av,
+        ):
             try:
-                n = gif.n_frames
+                data = await _lire_asset(variante())
             except Exception:
-                n = 1
-            if n > max_frames:
-                indices = [int(i * n / max_frames) for i in range(max_frames)]
-            else:
-                indices = list(range(n))
-            frames = []
-            for i in indices:
-                try:
-                    gif.seek(i)
-                    frames.append(gif.convert("RGB").copy())
-                except Exception:
-                    pass
-            if frames:
-                return frames, True
+                data = None
+            if data:
+                frames = _gif_en_frames(data, max_frames)
+                if frames:
+                    return frames, len(frames) > 1
+
+    for variante in (
+        lambda: av.replace(size=taille, static_format="png"),
+        lambda: av.replace(size=taille, format="png"),
+        lambda: av,
+    ):
+        try:
+            data = await _lire_asset(variante())
         except Exception:
-            pass
-    try:
-        data = await av.replace(size=taille, static_format="png").read()
-        return [Image.open(BytesIO(data)).convert("RGB")], False
-    except Exception:
-        return [Image.new("RGB", (taille, taille), (40, 42, 50))], False
+            data = None
+        if data:
+            try:
+                img = Image.open(BytesIO(data))
+            except Exception:
+                continue
+            if getattr(img, "is_animated", False):
+                fr = _gif_en_frames(data, max_frames)
+                if fr:
+                    return fr, len(fr) > 1
+            try:
+                return [img.convert("RGB")], False
+            except Exception:
+                continue
+    return [Image.new("RGB", (taille, taille), (40, 42, 50))], False
 
 
 def _carte_couronne(draw, cx, cy, w, col):
@@ -935,15 +995,20 @@ async def generer_carte(member, infos, vues=0, rang=0, bio=None, accent=None):
         base = Image.alpha_composite(base, Image.new("RGBA", (W, H), (0, 0, 0, 120)))
     draw = ImageDraw.Draw(base)
 
-    # Header en fondu : banniere si presente, sinon avatar floute
-    Hh = 176
-    head = (_couvrir(banner, W, Hh) if banner is not None
-            else _couvrir(avatar0, W, Hh).filter(ImageFilter.GaussianBlur(18))).convert("RGBA")
-    head = Image.alpha_composite(head, Image.new("RGBA", (W, Hh), (0, 0, 0, 95)))
+    # Header en fondu : banniere bien visible en haut, fondue en degrade vers le fond
+    Hh = 200
+    if banner is not None:
+        head = _couvrir(banner, W, Hh).convert("RGBA")
+        sombre = 55
+    else:
+        head = _couvrir(avatar0, W, Hh).filter(ImageFilter.GaussianBlur(16)).convert("RGBA")
+        sombre = 95
+    head = Image.alpha_composite(head, Image.new("RGBA", (W, Hh), (0, 0, 0, sombre)))
     fade = Image.new("L", (W, Hh), 0)
     fdd = ImageDraw.Draw(fade)
+    debut = Hh - 135
     for y in range(Hh):
-        a = 255 if y < Hh - 110 else int(255 * (1 - (y - (Hh - 110)) / 110))
+        a = 255 if y < debut else int(255 * (1 - (y - debut) / 135))
         fdd.line([(0, y), (W, y)], fill=max(0, a))
     base.paste(head, (0, 0), fade)
     draw = ImageDraw.Draw(base)
@@ -960,18 +1025,18 @@ async def generer_carte(member, infos, vues=0, rang=0, bio=None, accent=None):
     x = 224
     maxw = W - x - 44
     nm = _ajuster(draw, member.name, f_nom, maxw - 44)
-    _ombre(draw, (x, 100), nm, f_nom, blanc, dx=2, dy=3, alpha=185)
+    _ombre(draw, (x, 96), nm, f_nom, blanc, dx=2, dy=3, alpha=185)
     nw = draw.textlength(nm, font=f_nom)
     ex = x + nw + 18
     if niveau in ("Legendaire", "Mythique"):
-        _carte_couronne(draw, int(ex + 14), 128, 28, rgb)
+        _carte_couronne(draw, int(ex + 14), 122, 28, rgb)
     elif niveau in ("Rare", "Epique"):
-        _carte_etoile(draw, int(ex + 14), 128, 15, rgb)
-    yy = 152
+        _carte_etoile(draw, int(ex + 14), 122, 15, rgb)
+    yy = 168
     surnom = member.display_name
     if surnom and surnom != member.name:
-        _ombre(draw, (x, yy), f"@{surnom}", f_sur, gris, dx=1, dy=2, alpha=150); yy += 30
-    _ombre(draw, (x, yy), f"ID {member.id}", f_id, gris, dx=1, dy=2, alpha=150); yy += 28
+        _ombre(draw, (x, yy), f"@{surnom}", f_sur, gris, dx=1, dy=2, alpha=150); yy += 31
+    _ombre(draw, (x, yy), f"ID {member.id}", f_id, gris, dx=1, dy=2, alpha=150); yy += 29
     cree = member.created_at.strftime("%d/%m/%Y")
     age = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days // 365
     rejoint = member.joined_at.strftime("%m/%Y") if member.joined_at else "?"
