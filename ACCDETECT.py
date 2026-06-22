@@ -1482,8 +1482,7 @@ HELP_CATEGORIES = {
         ("!scan", "Lister les membres d'un critere (vers le salon de scan)."),
         ("!profil @membre", "Profil complet d'un membre."),
         ("!carte @membre", "Carte de profil en image (avatar, niveau, badges)."),
-        ("!tcg @membre", "Carte a collectionner holographique (rendu premium)."),
-        ("!holo @membre", "Carte holographique ANIMEE (GIF qui scintille)."),
+        ("!tcg @membre", "Carte a collectionner holographique ANIMEE (GIF)."),
         ("!list", "Liste des membres d'un critere (menu deroulant)."),
         ("!stats", "Tableau de bord global du serveur."),
         ("!top", "Classement des comptes les plus rares."),
@@ -1939,26 +1938,10 @@ async def carte(ctx, member: discord.Member = None):
                    file=discord.File(buf, filename="profil.png"), view=CarteView())
 
 
-@bot.command(name="tcg", aliases=["tcgcard", "collec"])
+@bot.command(name="tcg", aliases=["tcgcard", "collec", "holo", "anim"])
 @check_public()
 async def tcg(ctx, member: discord.Member = None):
-    """Genere une carte a collectionner holographique. Ex: !tcg @membre"""
-    if not PIL_OK:
-        await ctx.send("La librairie Pillow n'est pas installee (ajoute `Pillow` aux dependances).")
-        return
-    member = member or ctx.author
-    infos = collecter_infos(member)
-    vues = comptabiliser_vue(ctx.author, member)
-    async with ctx.typing():
-        buf = await generer_carte_tcg(member, infos, vues)
-    await ctx.send(content=f"👁 **{vues}** vue(s)",
-                   file=discord.File(buf, filename="carte_tcg.png"), view=CarteView())
-
-
-@bot.command(name="holo", aliases=["anim", "tcganim", "holographique"])
-@check_public()
-async def holo(ctx, member: discord.Member = None):
-    """Genere une carte a collectionner holographique ANIMEE (GIF). Ex: !holo @membre"""
+    """Genere une carte a collectionner holographique ANIMEE (GIF). Ex: !tcg @membre"""
     if not PIL_OK:
         await ctx.send("La librairie Pillow n'est pas installee (ajoute `Pillow` aux dependances).")
         return
@@ -1968,7 +1951,7 @@ async def holo(ctx, member: discord.Member = None):
     async with ctx.typing():
         buf = await generer_carte_tcg_anim(member, infos, vues)
     await ctx.send(content=f"👁 **{vues}** vue(s)",
-                   file=discord.File(buf, filename="carte_holo.gif"), view=CarteView())
+                   file=discord.File(buf, filename="carte_tcg.gif"), view=CarteView())
 
 
 @bot.command(name="list")
@@ -2021,6 +2004,11 @@ async def fame(ctx):
               for i, (v, m) in enumerate(classement, 1)]
     view = PageView(ctx.author, ctx.guild, "🏆 Classement Fame", lignes, discord.Color.gold())
     await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
+
+
+@bot.command(name="stats")
+@check_public()
+async def stats(ctx):
     compteur = {k: 0 for k in DETECT_KEYS}
     niveaux_count = {n: 0 for _, n, _, _ in NIVEAUX}
     total_rares = 0
