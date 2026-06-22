@@ -156,6 +156,9 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS salons_public (channel_id INTEGER PRIMARY KEY)")
     conn.execute("CREATE TABLE IF NOT EXISTS vues (profil_id INTEGER, viewer_id INTEGER, "
                  "PRIMARY KEY (profil_id, viewer_id))")
+    conn.execute("CREATE TABLE IF NOT EXISTS bios     (user_id INTEGER PRIMARY KEY, texte TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS couleurs (user_id INTEGER PRIMARY KEY, couleur TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS fonds_membres (user_id INTEGER PRIMARY KEY, data BLOB)")
     conn.commit(); conn.close()
 
 
@@ -262,6 +265,78 @@ def vues_par_profil():
     return dict(rows)
 
 
+def definir_bio(uid, texte):
+    conn = db()
+    if texte:
+        BIOS[uid] = texte
+        conn.execute("INSERT INTO bios (user_id, texte) VALUES (?,?) "
+                     "ON CONFLICT(user_id) DO UPDATE SET texte=excluded.texte", (uid, texte))
+    else:
+        BIOS.pop(uid, None)
+        conn.execute("DELETE FROM bios WHERE user_id=?", (uid,))
+    conn.commit(); conn.close()
+
+
+def definir_couleur(uid, couleur):
+    conn = db()
+    if couleur:
+        COULEURS[uid] = couleur
+        conn.execute("INSERT INTO couleurs (user_id, couleur) VALUES (?,?) "
+                     "ON CONFLICT(user_id) DO UPDATE SET couleur=excluded.couleur", (uid, couleur))
+    else:
+        COULEURS.pop(uid, None)
+        conn.execute("DELETE FROM couleurs WHERE user_id=?", (uid,))
+    conn.commit(); conn.close()
+
+
+def definir_fond_membre(uid, data):
+    conn = db()
+    conn.execute("DELETE FROM fonds_membres WHERE user_id=?", (uid,))
+    if data is not None:
+        conn.execute("INSERT INTO fonds_membres (user_id, data) VALUES (?,?)", (uid, data))
+    conn.commit(); conn.close()
+
+
+def fond_membre(uid):
+    conn = db()
+    row = conn.execute("SELECT data FROM fonds_membres WHERE user_id=?", (uid,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def couleur_membre(uid):
+    """Renvoie un tuple RGB si l'utilisateur a defini une couleur, sinon None."""
+    hexa = COULEURS.get(uid)
+    if not hexa:
+        return None
+    try:
+        h = hexa.lstrip("#")
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return None
+
+
+FAME_PALIERS = [(100, "Icône"), (40, "Légende"), (15, "Star"), (5, "Populaire"), (1, "Connu"), (0, "Inconnu")]
+
+
+def fame_titre(v):
+    for seuil, nom in FAME_PALIERS:
+        if v >= seuil:
+            return nom
+    return "Inconnu"
+
+
+def fame_rang(guild, uid):
+    """Rang (1 = le plus vu) de l'utilisateur parmi les membres du serveur. 0 si aucune vue."""
+    compte = vues_par_profil()
+    mes_vues = compte.get(uid, 0)
+    if mes_vues <= 0:
+        return 0
+    ids = {m.id for m in guild.members}
+    meilleurs = sorted((v for pid, v in compte.items() if pid in ids), reverse=True)
+    return meilleurs.index(mes_vues) + 1 if mes_vues in meilleurs else 0
+
+
 init_db()
 CONFIG = _charger("config", "key", "value")
 EMOJIS = _charger("emojis", "key", "emoji")
@@ -269,6 +344,8 @@ MESSAGES = _charger("messages", "key", "contenu")
 OWNERS = charger_owners()
 FOND_DATA = charger_fond()
 SALONS_PUBLIC = charger_salons_public()
+BIOS = _charger("bios", "user_id", "texte")
+COULEURS = _charger("couleurs", "user_id", "couleur")
 
 
 def emoji_de(key):
@@ -695,137 +772,284 @@ def _dessiner_vues(carte, x, y, vues, police, hauteur=42):
     return largeur
 
 
-async def generer_carte(member, infos, vues=0):
-    """Genere une carte de profil en image (PNG) premium, renvoie un buffer BytesIO."""
+async def _charger_frames_avatar(member, taille=256, max_frames=30):
+    """Renvoie (frames RGB, est_anime). Gere les avatars GIF animes."""
+    av = member.display_avatar
+    try:
+        anime = av.is_animated()
+    except Exception:
+        anime = False
+    if anime:
+        try:
+            data = await av.replace(size=taille, format="gif").read()
+            gif = Image.open(BytesIO(data))
+            try:
+                n = gif.n_frames
+            except Exception:
+                n = 1
+            if n > max_frames:
+                indices = [int(i * n / max_frames) for i in range(max_frames)]
+            else:
+                indices = list(range(n))
+            frames = []
+            for i in indices:
+                try:
+                    gif.seek(i)
+                    frames.append(gif.convert("RGB").copy())
+                except Exception:
+                    pass
+            if frames:
+                return frames, True
+        except Exception:
+            pass
+    try:
+        data = await av.replace(size=taille, static_format="png").read()
+        return [Image.open(BytesIO(data)).convert("RGB")], False
+    except Exception:
+        return [Image.new("RGB", (taille, taille), (40, 42, 50))], False
+
+
+def _carte_couronne(draw, cx, cy, w, col):
+    h = w * 0.8
+    x0 = cx - w / 2
+    y1 = cy + h / 2
+    pts = [(x0, y1), (x0, cy - h / 2), (x0 + w * 0.25, cy), (cx, cy - h * 0.6),
+           (x0 + w * 0.75, cy), (x0 + w, cy - h / 2), (x0 + w, y1)]
+    draw.polygon(pts, fill=col)
+
+
+def _carte_etoile(draw, cx, cy, r, fill):
+    pts = []
+    for i in range(10):
+        a = -math.pi / 2 + i * math.pi / 5
+        rr = r if i % 2 == 0 else r * 0.45
+        pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
+    draw.polygon(pts, fill=fill)
+
+
+def _carte_medaille(draw, cx, cy, r, col):
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
+    draw.ellipse([cx - r + 3, cy - r + 3, cx + r - 3, cy + r - 3], outline=(255, 255, 255, 170), width=1)
+
+
+def _carte_cluster_fame(carte, W, vues, rang, rgb):
+    """Bloc fame homogene en haut a droite : vues + rang + titre (ou Star du serveur)."""
+    draw = ImageDraw.Draw(carte)
+    f = _police(22, "SemiBold")
+    fb = _police(15, "Bold")
+    h, gap, y = 40, 10, 26
+    specs = [("eye", str(vues))]
+    if rang > 0:
+        specs.append(("rank", f"#{rang}"))
+    specs.append(("star", "STAR DU SERVEUR") if rang == 1 else ("title", fame_titre(vues).upper()))
+    widths = []
+    for kind, txt in specs:
+        if kind == "eye":
+            w = 14 + 24 + 9 + draw.textlength(txt, font=f) + 16
+        elif kind == "rank":
+            w = 14 + 18 + 8 + draw.textlength(txt, font=f) + 16
+        elif kind == "star":
+            w = 16 + 18 + 9 + draw.textlength(txt, font=fb) + 16
+        else:
+            w = 18 + draw.textlength(txt, font=f) + 18
+        widths.append(int(w))
+    x = W - 30 - (sum(widths) + gap * (len(specs) - 1))
+    for (kind, txt), w in zip(specs, widths):
+        if kind == "star":
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=(241, 196, 15))
+            _carte_etoile(draw, x + 18, y + h // 2, 9, (20, 20, 20))
+            draw.text((x + 34, y + h // 2), txt, font=fb, fill=(20, 20, 20), anchor="lm")
+        else:
+            layer = Image.new("RGBA", carte.size, (0, 0, 0, 0))
+            ImageDraw.Draw(layer).rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=(12, 14, 18, 190))
+            carte.alpha_composite(layer)
+            draw = ImageDraw.Draw(carte)
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, outline=rgb + (255,), width=2)
+            if kind == "eye":
+                _oeil(draw, int(x + 14 + 12), y + h // 2, 24)
+                draw.text((x + 14 + 24 + 9, y + h // 2), txt, font=f, fill=(240, 242, 245), anchor="lm")
+            elif kind == "rank":
+                _carte_medaille(draw, x + 14 + 9, y + h // 2, 9, rgb)
+                draw.text((x + 14 + 18 + 8, y + h // 2), txt, font=f, fill=(255, 255, 255), anchor="lm")
+            else:
+                draw.text((x + 18, y + h // 2), txt, font=f, fill=rgb + (255,), anchor="lm")
+        x += w + gap
+
+
+async def generer_carte(member, infos, vues=0, rang=0, bio=None, accent=None):
+    """Carte de profil premium. Renvoie (buffer, ext) ; ext='gif' si avatar anime, sinon 'png'."""
     score, niveau, _, _ = niveau_rarete(infos)
-    rgb = CARTE_COULEURS.get(niveau, (149, 165, 166))
-    L = 900
+    rgb = accent or CARTE_COULEURS.get(niveau, (149, 165, 166))
+    W = 900
+    f_nom = _police(50, "ExtraBold"); f_sur = _police(23, "Medium"); f_id = _police(19, "Medium")
+    f_date = _police(20, "Medium"); f_pill = _police(25, "SemiBold"); f_pet = _police(21, "Medium")
+    f_chip = _police(22, "SemiBold"); f_bio = _police(23, "Medium")
+    blanc, gris = (255, 255, 255, 255), (206, 211, 218, 255)
 
-    f_nom = _police(58, "ExtraBold")
-    f_id = _police(24, "Medium")
-    f_pill = _police(27, "SemiBold")
-    f_pet = _police(22, "Medium")
-    f_chip = _police(23, "SemiBold")
-    blanc, gris = (255, 255, 255, 255), (202, 207, 214, 255)
+    frames_av, anime = await _charger_frames_avatar(member, 256)
+    avatar0 = frames_av[0]
+    perso = fond_membre(member.id)
+    banner = None
+    try:
+        u = await bot.fetch_user(member.id)
+        if u and u.banner:
+            banner = Image.open(BytesIO(await u.banner.replace(size=600, static_format="png").read())).convert("RGB")
+    except Exception:
+        pass
 
-    # Attributs -> pastilles
     cles = list(infos["badges"]) + list(infos["pseudo"])
     for extra in (infos["anciennete"], infos["boost"]):
         if extra:
             cles.append(extra)
     labels = [SET_ITEMS[k]["label"] for k in cles] or ["Compte standard"]
 
-    # Mesure prealable -> hauteur dynamique
     mes = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-    pad, gap, ch = 20, 12, 42
-    x_chip, maxx = 55, L - 45
-    chip_w = [mes.textlength(lab, font=f_chip) + pad * 2 for lab in labels]
-    cur, rows = x_chip, 1
+    pad, gap, ch = 20, 12, 40
+    x0, maxx = 44, W - 44
+    chip_w = [mes.textlength(l, font=f_chip) + pad * 2 for l in labels]
+    cur, rows = x0, 1
     for w in chip_w:
-        if cur + w > maxx and cur > x_chip:
+        if cur + w > maxx and cur > x0:
             rows += 1
-            cur = x_chip
+            cur = x0
         cur += w + gap
-    cy0 = 392
-    H = cy0 + rows * ch + (rows - 1) * gap + 24
+    y_pillrow, y_bio = 270, 326
+    y_prog = y_bio + (44 if bio else 0)
+    y_chips = y_prog + 72
+    H = y_chips + rows * ch + (rows - 1) * gap + 24
 
-    # --- Fond : 1) perso  2) banniere  3) degrade ---
-    carte = _fond_degrade(L, H, _melange((38, 40, 48), rgb, 0.12), (16, 17, 20))
-    image_fond = False
-    if FOND_DATA:
-        try:
-            img = Image.open(BytesIO(FOND_DATA)).convert("RGBA")
-            carte = _couvrir(img, L, H)
-            image_fond = True
-        except Exception:
-            pass
-    if not image_fond:
-        u = await recuperer_user(member)
-        if u and u.banner:
+    # Fond du corps : perso > global > degrade
+    def _fond_image(data):
+        return _couvrir(Image.open(BytesIO(data)).convert("RGB"), W, H).convert("RGBA")
+    base, custom_bg = None, False
+    for src in (perso, FOND_DATA):
+        if src:
             try:
-                bdata = await u.banner.replace(size=600, static_format="png").read()
-                carte = _couvrir(Image.open(BytesIO(bdata)).convert("RGBA"), L, H).filter(ImageFilter.GaussianBlur(8))
-                image_fond = True
+                base = _fond_image(src); custom_bg = True; break
             except Exception:
-                pass
+                base = None
+    if base is None:
+        base = _fond_degrade(W, H, _melange(rgb, (26, 27, 32), 0.80), (13, 14, 17))
+    if custom_bg:
+        base = Image.alpha_composite(base, Image.new("RGBA", (W, H), (0, 0, 0, 120)))
+    draw = ImageDraw.Draw(base)
 
-    # Assombrissement + voile gauche pour la lisibilite (seulement si image de fond)
-    if image_fond:
-        carte = Image.alpha_composite(carte, Image.new("RGBA", (L, H), (0, 0, 0, 70)))
-        carte = Image.alpha_composite(carte, _voile_gauche(L, H))
+    # Header en fondu : banniere si presente, sinon avatar floute
+    Hh = 176
+    head = (_couvrir(banner, W, Hh) if banner is not None
+            else _couvrir(avatar0, W, Hh).filter(ImageFilter.GaussianBlur(18))).convert("RGBA")
+    head = Image.alpha_composite(head, Image.new("RGBA", (W, Hh), (0, 0, 0, 95)))
+    fade = Image.new("L", (W, Hh), 0)
+    fdd = ImageDraw.Draw(fade)
+    for y in range(Hh):
+        a = 255 if y < Hh - 110 else int(255 * (1 - (y - (Hh - 110)) / 110))
+        fdd.line([(0, y), (W, y)], fill=max(0, a))
+    base.paste(head, (0, 0), fade)
+    draw = ImageDraw.Draw(base)
 
-    # --- Lueur autour de l'avatar ---
-    ax, ay, ad, ring = 55, 128, 205, 6
-    glow = Image.new("RGBA", (L, H), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse([ax - ring - 22, ay - ring - 22, ax + ad + ring + 22, ay + ad + ring + 22],
-                                 fill=rgb + (135,))
-    carte = Image.alpha_composite(carte, glow.filter(ImageFilter.GaussianBlur(20)))
-    draw = ImageDraw.Draw(carte)
-
-    # --- Avatar + anneau ---
+    # Avatar : lueur + anneau (image posee plus tard, par frame)
+    ax, ay, ad, ring = 44, 90, 152, 6
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([ax - ring - 16, ay - ring - 16, ax + ad + ring + 16, ay + ad + ring + 16], fill=rgb + (120,))
+    base = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(18)))
+    draw = ImageDraw.Draw(base)
     draw.ellipse([ax - ring, ay - ring, ax + ad + ring, ay + ad + ring], fill=rgb + (255,))
-    try:
-        adata = await member.display_avatar.replace(size=256, static_format="png").read()
-        av = Image.open(BytesIO(adata)).convert("RGBA").resize((ad, ad))
-        m = Image.new("L", (ad, ad), 0)
-        ImageDraw.Draw(m).ellipse([0, 0, ad, ad], fill=255)
-        carte.paste(av, (ax, ay), m)
-    except Exception:
-        draw.ellipse([ax, ay, ax + ad, ay + ad], fill=(40, 42, 50, 255))
 
-    x = 300
-    maxw = L - x - 45
-    _ombre(draw, (x, 116), _ajuster(draw, member.name, f_nom, maxw), f_nom, blanc, dx=2, dy=3, alpha=170)
-    _ombre(draw, (x, 188), f"ID  {member.id}", f_id, gris, dx=1, dy=2, alpha=150)
+    # Identite
+    x = 224
+    maxw = W - x - 44
+    nm = _ajuster(draw, member.name, f_nom, maxw - 44)
+    _ombre(draw, (x, 100), nm, f_nom, blanc, dx=2, dy=3, alpha=185)
+    nw = draw.textlength(nm, font=f_nom)
+    ex = x + nw + 18
+    if niveau in ("Legendaire", "Mythique"):
+        _carte_couronne(draw, int(ex + 14), 128, 28, rgb)
+    elif niveau in ("Rare", "Epique"):
+        _carte_etoile(draw, int(ex + 14), 128, 15, rgb)
+    yy = 152
+    surnom = member.display_name
+    if surnom and surnom != member.name:
+        _ombre(draw, (x, yy), f"@{surnom}", f_sur, gris, dx=1, dy=2, alpha=150); yy += 30
+    _ombre(draw, (x, yy), f"ID {member.id}", f_id, gris, dx=1, dy=2, alpha=150); yy += 28
+    cree = member.created_at.strftime("%d/%m/%Y")
+    age = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days // 365
+    rejoint = member.joined_at.strftime("%m/%Y") if member.joined_at else "?"
+    _ombre(draw, (x, yy), f"Créé {cree} ({age} ans)   ·   Arrivé {rejoint}", f_date, gris, dx=1, dy=2, alpha=150)
 
-    # --- Pastille de niveau (avec ombre floue) ---
+    # Pastille de niveau
     txt = f"{niveau.upper()}   {score} PTS"
     tw = draw.textlength(txt, font=f_pill)
-    py, pillw = 228, tw + 48
-    sh = Image.new("RGBA", (L, H), (0, 0, 0, 0))
-    ImageDraw.Draw(sh).rounded_rectangle([x, py + 5, x + pillw, py + 55], radius=26, fill=(0, 0, 0, 120))
-    carte = Image.alpha_composite(carte, sh.filter(ImageFilter.GaussianBlur(6)))
-    draw = ImageDraw.Draw(carte)
-    draw.rounded_rectangle([x, py, x + pillw, py + 50], radius=25, fill=rgb + (255,))
-    draw.text((x + 24, py + 25), txt, font=f_pill, fill=(12, 14, 16, 255), anchor="lm")
+    pillw = tw + 44
+    sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).rounded_rectangle([x0, y_pillrow + 4, x0 + pillw, y_pillrow + 50], radius=24, fill=(0, 0, 0, 110))
+    base = Image.alpha_composite(base, sh.filter(ImageFilter.GaussianBlur(6)))
+    draw = ImageDraw.Draw(base)
+    draw.rounded_rectangle([x0, y_pillrow, x0 + pillw, y_pillrow + 46], radius=23, fill=rgb + (255,))
+    draw.text((x0 + 22, y_pillrow + 23), txt, font=f_pill, fill=(14, 15, 18), anchor="lm")
 
-    # --- Barre de progression ---
+    if bio:
+        draw.text((x0, y_bio), _ajuster(draw, f"\u00ab {bio} \u00bb", f_bio, W - 88), font=f_bio, fill=(226, 228, 233), anchor="lm")
+
+    # Barre de progression (degradee)
     frac, nxt = _progression(score)
-    bx, by, bw, bh = x, 308, maxw, 22
-    draw.rounded_rectangle([bx, by, bx + bw, by + bh], radius=bh // 2, fill=(255, 255, 255, 45))
+    bx, by, bw2, bh = x0, y_prog, W - 88, 22
+    draw.rounded_rectangle([bx, by, bx + bw2, by + bh], radius=bh // 2, fill=(255, 255, 255, 40))
     if frac > 0:
-        draw.rounded_rectangle([bx, by, bx + max(bh, int(bw * frac)), by + bh], radius=bh // 2, fill=rgb + (255,))
-    label = f"Plus que {nxt - score} pts pour le palier suivant" if nxt else "Palier maximum atteint"
-    _ombre(draw, (bx, by + bh + 12), label, f_pet, gris, dx=1, dy=2, alpha=150)
+        fw = max(bh, int(bw2 * frac))
+        grad = _fond_degrade(fw, bh, _melange(rgb, (255, 255, 255), 0.25), rgb)
+        gm = Image.new("L", (fw, bh), 0)
+        ImageDraw.Draw(gm).rounded_rectangle([0, 0, fw - 1, bh - 1], radius=bh // 2, fill=255)
+        base.paste(grad, (bx, by), gm)
+        draw = ImageDraw.Draw(base)
+    draw.text((bx, by + bh + 12), (f"Plus que {nxt - score} pts pour le palier suivant" if nxt else "Palier maximum atteint"),
+              font=f_pet, fill=gris, anchor="lt")
 
-    # --- Pastilles d'attributs (translucides, multi-lignes) ---
-    cxx, cyy = x_chip, cy0
-    for lab, w in zip(labels, chip_w):
-        if cxx + w > maxx and cxx > x_chip:
-            cxx, cyy = x_chip, cyy + ch + gap
-        couche = Image.new("RGBA", (L, H), (0, 0, 0, 0))
-        ImageDraw.Draw(couche).rounded_rectangle([cxx, cyy, cxx + w, cyy + ch], radius=ch // 2, fill=(10, 12, 14, 165))
-        carte = Image.alpha_composite(carte, couche)
-        draw = ImageDraw.Draw(carte)
+    # Pastilles d'attributs
+    cxx, cyy = x0, y_chips
+    for l, w in zip(labels, chip_w):
+        if cxx + w > maxx and cxx > x0:
+            cxx, cyy = x0, cyy + ch + gap
+        couche = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(couche).rounded_rectangle([cxx, cyy, cxx + w, cyy + ch], radius=ch // 2, fill=(10, 12, 14, 170))
+        base = Image.alpha_composite(base, couche)
+        draw = ImageDraw.Draw(base)
         draw.rounded_rectangle([cxx, cyy, cxx + w, cyy + ch], radius=ch // 2, outline=rgb + (255,), width=2)
-        draw.text((cxx + pad, cyy + ch // 2), lab, font=f_chip, fill=(236, 238, 241, 255), anchor="lm")
+        draw.text((cxx + pad, cyy + ch // 2), l, font=f_chip, fill=(235, 237, 240), anchor="lm")
         cxx += w + gap
 
-    # --- Pastille de vues (haut-droite) ---
-    fv = _police(24, "SemiBold")
-    largeur_v = int(14 + int(42 * 0.62) + 8 + draw.textlength(str(vues), font=fv) + 14)
-    _dessiner_vues(carte, L - 30 - largeur_v, 28, vues, fv)
+    # Cluster fame (haut-droite, unique)
+    _carte_cluster_fame(base, W, vues, rang, rgb)
 
-    # --- Coins arrondis ---
-    masque = Image.new("L", (L, H), 0)
-    ImageDraw.Draw(masque).rounded_rectangle([0, 0, L - 1, H - 1], radius=36, fill=255)
-    final = Image.new("RGBA", (L, H), (0, 0, 0, 0))
-    final.paste(carte, (0, 0), masque)
+    # Composition avatar + coins arrondis
+    am = Image.new("L", (ad, ad), 0)
+    ImageDraw.Draw(am).ellipse([0, 0, ad, ad], fill=255)
+    corner = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(corner).rounded_rectangle([0, 0, W - 1, H - 1], radius=34, fill=255)
 
+    def _composer(avimg):
+        c = base.copy()
+        c.paste(_couvrir(avimg, ad, ad).convert("RGBA"), (ax, ay), am)
+        return c
+
+    if not anime:
+        final = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        final.paste(_composer(avatar0), (0, 0), corner)
+        buf = BytesIO()
+        final.save(buf, format="PNG")
+        buf.seek(0)
+        return buf, "png"
+
+    fond = (30, 31, 34)
+    imgs = []
+    for fr in frames_av:
+        plein = Image.new("RGB", (W, H), fond)
+        plein.paste(_composer(fr).convert("RGB"), (0, 0), corner)
+        imgs.append(plein)
     buf = BytesIO()
-    final.save(buf, format="PNG")
+    imgs[0].save(buf, format="GIF", save_all=True, append_images=imgs[1:], duration=90, loop=0, optimize=True, disposal=2)
     buf.seek(0)
-    return buf
+    return buf, "gif"
+
 
 
 # ==============================================================================
@@ -1074,8 +1298,8 @@ def _tcg_bandes_anim(W, H, phase, n=2.4, scale=5):
     return Image.frombytes("L", (w, h), bytes(data)).resize((W, H)).filter(ImageFilter.GaussianBlur(6))
 
 
-def _tcg_base_anim(member, infos, vues, avatar):
-    """Construit la carte statique (tout sauf l'holo anime). Renvoie (base RGB, frame_reg, art_reg)."""
+def _tcg_base_anim(member, infos, vues):
+    """Construit la carte TCG SANS l'avatar (pose par frame). Renvoie base + masques + overlays."""
     score, niveau, _, _ = niveau_rarete(infos)
     col = TIERS_TCG.get(niveau, TIERS_TCG["Commun"])["c"]
     et = TIERS_TCG.get(niveau, TIERS_TCG["Commun"])["et"]
@@ -1109,12 +1333,8 @@ def _tcg_base_anim(member, infos, vues, avatar):
     draw.text((gx, gy), str(score), font=_police(30, "ExtraBold"), fill=(15, 15, 18), anchor="mm")
 
     ax0, ay0, ax1, ay1 = M, 138, W - M, 612
-    aw, ah = ax1 - ax0, ay1 - ay0
-    art = _couvrir(avatar, aw, ah).convert("RGBA")
-    amask = Image.new("L", (aw, ah), 0)
-    ImageDraw.Draw(amask).rounded_rectangle([0, 0, aw - 1, ah - 1], radius=18, fill=255)
-    carte.paste(art, (ax0, ay0), amask)
-    draw = ImageDraw.Draw(carte)
+    # fond sombre de la fenetre (au cas ou) + cadre
+    draw.rounded_rectangle([ax0, ay0, ax1, ay1], radius=18, fill=_melange(col, (0, 0, 0), 0.55))
     draw.rounded_rectangle([ax0, ay0, ax1, ay1], radius=18, outline=col, width=3)
 
     draw.rounded_rectangle([M, 628, W - M, 684], radius=14, fill=_melange(mid, (0, 0, 0), 0.25), outline=col, width=2)
@@ -1136,35 +1356,42 @@ def _tcg_base_anim(member, infos, vues, avatar):
     draw.text((W // 2, 1000), f"N° {int(str(uid)[-4:]):04d}", font=_police(22, "Medium"), fill=(200, 205, 212), anchor="mm")
     draw.text((W - M - 10, 1000), f"{score} PTS", font=_police(24, "Bold"), fill=col, anchor="rm")
 
+    art_box = (ax0, ay0, ax1, ay1)
     art_reg = Image.new("L", (W, H), 0)
     ImageDraw.Draw(art_reg).rounded_rectangle([ax0, ay0, ax1, ay1], radius=18, fill=255)
-    # Gloss + paillettes statiques
-    gl = ImageChops.multiply(_tcg_gloss(W, H, (ax0, ay0, ax1, ay1)), art_reg)
-    carte = Image.alpha_composite(carte, Image.merge("RGBA", (Image.new("L", (W, H), 255),) * 3 + (gl,)))
+
+    # Overlays (gloss + paillettes + pastille vues) -> poses PAR-DESSUS l'avatar a chaque frame
+    overlays = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gl = ImageChops.multiply(_tcg_gloss(W, H, art_box), art_reg)
+    overlays = Image.alpha_composite(overlays, Image.merge("RGBA", (Image.new("L", (W, H), 255),) * 3 + (gl,)))
     if et >= 4:
-        pa = _tcg_paillettes(W, H, uid, (ax0, ay0, ax1, ay1), et * 5)
+        pa = _tcg_paillettes(W, H, uid, art_box, et * 5)
         pa = Image.composite(pa, Image.new("RGBA", (W, H), (0, 0, 0, 0)), art_reg)
-        carte = Image.alpha_composite(carte, pa)
-    # Pastille de vues
-    _dessiner_vues(carte, ax0 + 14, ay0 + 14, vues, _police(24, "SemiBold"), hauteur=40)
+        overlays = Image.alpha_composite(overlays, pa)
+    _dessiner_vues(overlays, ax0 + 14, ay0 + 14, vues, _police(24, "SemiBold"), hauteur=40)
 
     frame_reg = Image.new("L", (W, H), 0)
     fr = ImageDraw.Draw(frame_reg)
     fr.rounded_rectangle([6, 6, W - 6, H - 6], radius=42, fill=255)
     fr.rounded_rectangle([30, 30, W - 30, H - 30], radius=32, fill=0)
-    return carte.convert("RGB"), frame_reg, art_reg, niveau
+    return carte.convert("RGB"), frame_reg, art_reg, art_box, overlays, niveau
 
 
 async def generer_carte_tcg_anim(member, infos, vues=0, frames=16):
-    """Genere une carte TCG holographique ANIMEE (GIF) -> buffer BytesIO. Chaque palier scintille."""
-    try:
-        adata = await member.display_avatar.replace(size=256, static_format="png").read()
-        avatar = Image.open(BytesIO(adata)).convert("RGB")
-    except Exception:
-        avatar = Image.new("RGB", (256, 256), (40, 42, 50))
+    """Carte TCG holographique animee (GIF). L'avatar anime (si GIF) bouge avec l'holo."""
+    frames_av, _anime = await _charger_frames_avatar(member, 256)
+    n_av = len(frames_av)
 
-    base, frame_reg, art_reg, niveau = _tcg_base_anim(member, infos, vues, avatar)
+    base, frame_reg, art_reg, art_box, overlays, niveau = _tcg_base_anim(member, infos, vues)
     W, H = base.size
+    ax0, ay0, ax1, ay1 = art_box
+    aw, ah = ax1 - ax0, ay1 - ay0
+    amask = Image.new("L", (aw, ah), 0)
+    ImageDraw.Draw(amask).rounded_rectangle([0, 0, aw - 1, ah - 1], radius=18, fill=255)
+
+    # pre-decoupe des frames d'avatar a la taille de la fenetre
+    av_window = [_couvrir(fr, aw, ah).convert("RGBA") for fr in frames_av]
+
     inten = HOLO_ANIM.get(niveau, 0.12)
     hue = _tcg_hue_index(W, H)
     corner = Image.new("L", (W, H), 0)
@@ -1174,13 +1401,19 @@ async def generer_carte_tcg_anim(member, infos, vues=0, frames=16):
     imgs = []
     for f in range(frames):
         ph = f / frames
+        # avatar (echantillonne sur la duree -> boucle propre)
+        av = av_window[int(f * n_av / frames) % n_av]
+        canvas = base.convert("RGBA")
+        canvas.paste(av, (ax0, ay0), amask)
+        canvas = Image.alpha_composite(canvas, overlays)
+        rgb = canvas.convert("RGB")
+        # holo
         p = hue.copy().convert("P")
         p.putpalette(_tcg_palette_rb(int(ph * 256)))
         rb = p.convert("RGB")
         bd = _tcg_bandes_anim(W, H, ph * 2 * math.pi)
         mframe = ImageChops.multiply(frame_reg, bd).point(lambda v: int(min(255, v * inten * 2.4)))
         mart = ImageChops.multiply(art_reg, bd).point(lambda v: int(min(255, v * inten * 1.3)))
-        rgb = base.copy()
         rgb = Image.composite(ImageChops.screen(rgb, rb), rgb, mframe)
         rgb = Image.composite(ImageChops.overlay(rgb, rb), rgb, mart)
         plein = Image.new("RGB", (W, H), fond)
@@ -1192,6 +1425,7 @@ async def generer_carte_tcg_anim(member, infos, vues=0, frames=16):
                  duration=80, loop=0, optimize=True, disposal=2)
     buf.seek(0)
     return buf
+
 
 
 # ==============================================================================
@@ -1481,13 +1715,18 @@ HELP_CATEGORIES = {
     "🔍 Detection": [
         ("!scan", "Lister les membres d'un critere (vers le salon de scan)."),
         ("!profil @membre", "Profil complet d'un membre."),
-        ("!carte @membre", "Carte de profil en image (avatar, niveau, badges)."),
+        ("!carte @membre", "Carte de profil premium (image, ou GIF si avatar anime)."),
         ("!tcg @membre", "Carte a collectionner holographique ANIMEE (GIF)."),
         ("!list", "Liste des membres d'un critere (menu deroulant)."),
         ("!stats", "Tableau de bord global du serveur."),
         ("!top", "Classement des comptes les plus rares."),
         ("!fame", "Classement des profils les plus vus (vues uniques)."),
         ("!bareme", "Bareme de rarete (menu par categorie)."),
+    ],
+    "🎨 Personnalisation": [
+        ("!setbio <texte>", "Ta phrase affichee sur ta carte (`reset` pour enlever)."),
+        ("!setcouleur #hex", "Ta couleur d'accent sur ta carte (`reset` pour enlever)."),
+        ("!setfondperso <url|image>", "Ton fond de carte perso (`reset` pour enlever)."),
     ],
     "⚙️ Configuration": [
         ("!set", "Panneau interactif (roles, salons, alertes)."),
@@ -1863,6 +2102,66 @@ async def setfond(ctx, url: str = None):
                    file=apercu)
 
 
+@bot.command(name="setbio", aliases=["bio"])
+@check_public()
+async def setbio(ctx, *, texte: str = None):
+    """Definit ta phrase de presentation affichee sur ta carte. `!setbio` seul pour l'enlever."""
+    if texte is None or texte.lower() in ("reset", "clear", "off", "none"):
+        definir_bio(ctx.author.id, None)
+        await ctx.send("🗑️ Ta bio a ete retiree de ta carte.")
+        return
+    texte = " ".join(texte.split())[:120]
+    definir_bio(ctx.author.id, texte)
+    await ctx.send(f"✅ Bio enregistree : « {texte} »\nFais `!carte` pour la voir.")
+
+
+@bot.command(name="setcouleur", aliases=["setcolor", "couleur"])
+@check_public()
+async def setcouleur(ctx, couleur: str = None):
+    """Definit ta couleur d'accent (hex). Ex: `!setcouleur #9B59B6`. `!setcouleur reset` pour enlever."""
+    if couleur is None or couleur.lower() in ("reset", "clear", "off", "none"):
+        definir_couleur(ctx.author.id, None)
+        await ctx.send("🗑️ Couleur perso retiree (retour a la couleur de rarete).")
+        return
+    h = couleur.lstrip("#")
+    if len(h) != 6 or any(c not in "0123456789abcdefABCDEF" for c in h):
+        await ctx.send("❌ Donne une couleur hex valide, ex: `!setcouleur #9B59B6`.")
+        return
+    definir_couleur(ctx.author.id, "#" + h.upper())
+    apercu = Image.new("RGB", (240, 80), tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)))
+    bf = BytesIO(); apercu.save(bf, format="PNG"); bf.seek(0)
+    await ctx.send(f"✅ Couleur d'accent enregistree : #{h.upper()}\nFais `!carte` pour la voir.",
+                   file=discord.File(bf, filename="couleur.png"))
+
+
+@bot.command(name="setfondperso", aliases=["setfondme", "monfond"])
+@check_public()
+async def setfondperso(ctx, url: str = None):
+    """Definit TON fond de carte perso. Joins une image OU donne une URL. `!setfondperso reset` pour enlever."""
+    if not PIL_OK:
+        await ctx.send("Pillow n'est pas installe."); return
+    if url and url.lower() in ("reset", "clear", "off", "none"):
+        definir_fond_membre(ctx.author.id, None)
+        await ctx.send("🗑️ Ton fond perso a ete retire."); return
+    if ctx.message.attachments:
+        url = ctx.message.attachments[0].url
+    if not url:
+        await ctx.send("Donne une image : `!setfondperso <url>` ou **joins une image**.\nPour enlever : `!setfondperso reset`.")
+        return
+    async with ctx.typing():
+        data = await _telecharger(url)
+        if not data:
+            await ctx.send("❌ Impossible de telecharger cette image."); return
+        try:
+            img = Image.open(BytesIO(data)).convert("RGB")
+        except Exception:
+            await ctx.send("❌ Ce fichier n'est pas une image valide."); return
+        img = _couvrir(img, 900, 560)
+        buf = BytesIO(); img.save(buf, format="JPEG", quality=85)
+        definir_fond_membre(ctx.author.id, buf.getvalue())
+    await ctx.send("✅ Fond perso enregistre ! Fais `!carte` pour voir le rendu.")
+
+
 @bot.command(name="scan")
 @check_owner()
 async def scan(ctx):
@@ -1925,17 +2224,20 @@ async def profil(ctx, member: discord.Member = None):
 @bot.command(name="carte", aliases=["card"])
 @check_public()
 async def carte(ctx, member: discord.Member = None):
-    """Genere une carte de profil en image. Ex: !carte @membre"""
+    """Genere une carte de profil (image, ou GIF si avatar anime). Ex: !carte @membre"""
     if not PIL_OK:
         await ctx.send("La librairie Pillow n'est pas installee (ajoute `Pillow` aux dependances).")
         return
     member = member or ctx.author
     infos = collecter_infos(member)
     vues = comptabiliser_vue(ctx.author, member)
+    rang = fame_rang(ctx.guild, member.id)
+    bio = BIOS.get(member.id)
+    accent = couleur_membre(member.id)
     async with ctx.typing():
-        buf = await generer_carte(member, infos, vues)
+        buf, ext = await generer_carte(member, infos, vues, rang, bio, accent)
     await ctx.send(content=f"👁 **{vues}** vue(s)",
-                   file=discord.File(buf, filename="profil.png"), view=CarteView())
+                   file=discord.File(buf, filename=f"carte.{ext}"), view=CarteView())
 
 
 @bot.command(name="tcg", aliases=["tcgcard", "collec", "holo", "anim"])
