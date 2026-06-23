@@ -16,6 +16,7 @@ import math
 import random
 import colorsys
 import asyncio
+import re
 from io import BytesIO
 import aiohttp
 import discord
@@ -328,12 +329,14 @@ def fame_titre(v):
 
 
 def fame_rang(guild, uid):
-    """Rang (1 = le plus vu) de l'utilisateur parmi les membres du serveur. 0 si aucune vue."""
+    """Rang (1 = le plus vu) de l'utilisateur parmi les membres du serveur. 0 si aucune vue / non-membre."""
     compte = vues_par_profil()
     mes_vues = compte.get(uid, 0)
     if mes_vues <= 0:
         return 0
     ids = {m.id for m in guild.members}
+    if uid not in ids:
+        return 0
     meilleurs = sorted((v for pid, v in compte.items() if pid in ids), reverse=True)
     return meilleurs.index(mes_vues) + 1 if mes_vues in meilleurs else 0
 
@@ -478,6 +481,37 @@ async def recuperer_user(member):
         return None
 
 
+async def resoudre_cible(ctx, ref):
+    """Resout une reference (mention, ID, nom, ou None).
+    Renvoie un Member si la personne est dans le serveur, sinon un User global (meme hors serveur).
+    Renvoie None si introuvable."""
+    if ref is None:
+        return ctx.author
+    s = str(ref).strip()
+    uid = None
+    m = re.match(r"^<@!?(\d+)>$", s)
+    if m:
+        uid = int(m.group(1))
+    elif s.isdigit():
+        uid = int(s)
+    if uid is not None:
+        if ctx.guild:
+            membre = ctx.guild.get_member(uid)
+            if membre:
+                return membre
+        try:
+            return await bot.fetch_user(uid)
+        except Exception:
+            return None
+    # Recherche par nom / surnom dans le serveur
+    if ctx.guild:
+        bas = s.lower().lstrip("@")
+        for mm in ctx.guild.members:
+            if mm.name.lower() == bas or mm.display_name.lower() == bas or (mm.nick and mm.nick.lower() == bas):
+                return mm
+    return None
+
+
 OG_THRESHOLDS = dict(OG_SEUILS)
 
 
@@ -571,8 +605,9 @@ def embed_profil(member, infos, titre):
     embed.add_field(name="📅 Compte cree",
                     value=f"<t:{int(member.created_at.timestamp())}:D>\n(il y a {annees} an(s) et {jours} j)",
                     inline=True)
-    if member.joined_at:
-        embed.add_field(name="📥 A rejoint", value=f"<t:{int(member.joined_at.timestamp())}:R>", inline=True)
+    j = getattr(member, "joined_at", None)
+    if j:
+        embed.add_field(name="📥 A rejoint", value=f"<t:{int(j.timestamp())}:R>", inline=True)
 
     # Badges = emojis seuls (badges + pseudo + anciennete + boost), sans texte.
     cles = list(infos["badges"]) + list(infos["pseudo"])
@@ -1039,8 +1074,12 @@ async def generer_carte(member, infos, vues=0, rang=0, bio=None, accent=None):
     _ombre(draw, (x, yy), f"ID {member.id}", f_id, gris, dx=1, dy=2, alpha=150); yy += 29
     cree = member.created_at.strftime("%d/%m/%Y")
     age = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days // 365
-    rejoint = member.joined_at.strftime("%m/%Y") if member.joined_at else "?"
-    _ombre(draw, (x, yy), f"Créé {cree} ({age} ans)   ·   Arrivé {rejoint}", f_date, gris, dx=1, dy=2, alpha=150)
+    j = getattr(member, "joined_at", None)
+    if j:
+        ligne_dates = f"Créé {cree} ({age} ans)   ·   Arrivé {j.strftime('%m/%Y')}"
+    else:
+        ligne_dates = f"Créé {cree} ({age} ans)   ·   Hors serveur"
+    _ombre(draw, (x, yy), ligne_dates, f_date, gris, dx=1, dy=2, alpha=150)
 
     # Pastille de niveau
     txt = f"{niveau.upper()}   {score} PTS"
@@ -2317,8 +2356,11 @@ class CarteModifierView(discord.ui.View):
 
 @bot.command(name="profil", aliases=["check"])
 @check_public()
-async def profil(ctx, member: discord.Member = None):
-    member = member or ctx.author
+async def profil(ctx, *, ref: str = None):
+    member = await resoudre_cible(ctx, ref)
+    if member is None:
+        await ctx.send("❌ Utilisateur introuvable. Donne une **mention**, un **ID**, ou un **pseudo** valide.")
+        return
     infos = collecter_infos(member)
     vues = comptabiliser_vue(ctx.author, member)
     u = await recuperer_user(member)
@@ -2331,15 +2373,18 @@ async def profil(ctx, member: discord.Member = None):
 
 @bot.command(name="carte", aliases=["card"])
 @check_public()
-async def carte(ctx, member: discord.Member = None):
-    """Genere une carte de profil (image, ou GIF si avatar anime). Ex: !carte @membre"""
+async def carte(ctx, *, ref: str = None):
+    """Genere une carte de profil (image, ou GIF si avatar anime). Ex: !carte @membre / !carte <id>"""
     if not PIL_OK:
         await ctx.send("La librairie Pillow n'est pas installee (ajoute `Pillow` aux dependances).")
         return
-    member = member or ctx.author
+    member = await resoudre_cible(ctx, ref)
+    if member is None:
+        await ctx.send("❌ Utilisateur introuvable. Donne une **mention**, un **ID**, ou un **pseudo** valide.")
+        return
     infos = collecter_infos(member)
     vues = comptabiliser_vue(ctx.author, member)
-    rang = fame_rang(ctx.guild, member.id)
+    rang = fame_rang(ctx.guild, member.id) if ctx.guild else 0
     bio = BIOS.get(member.id)
     accent = couleur_membre(member.id)
     async with ctx.typing():
@@ -2351,12 +2396,15 @@ async def carte(ctx, member: discord.Member = None):
 
 @bot.command(name="tcg", aliases=["tcgcard", "collec", "holo", "anim"])
 @check_public()
-async def tcg(ctx, member: discord.Member = None):
-    """Genere une carte a collectionner holographique ANIMEE (GIF). Ex: !tcg @membre"""
+async def tcg(ctx, *, ref: str = None):
+    """Genere une carte a collectionner holographique ANIMEE (GIF). Ex: !tcg @membre / !tcg <id>"""
     if not PIL_OK:
         await ctx.send("La librairie Pillow n'est pas installee (ajoute `Pillow` aux dependances).")
         return
-    member = member or ctx.author
+    member = await resoudre_cible(ctx, ref)
+    if member is None:
+        await ctx.send("❌ Utilisateur introuvable. Donne une **mention**, un **ID**, ou un **pseudo** valide.")
+        return
     infos = collecter_infos(member)
     vues = comptabiliser_vue(ctx.author, member)
     async with ctx.typing():
@@ -2593,7 +2641,12 @@ async def unallow(ctx, salon: discord.TextChannel = None):
 
 @bot.command(name="owner")
 @check_buyer()
-async def owner_cmd(ctx, membre: discord.User):
+async def owner_cmd(ctx, *, ref: str = None):
+    if not ref:
+        await ctx.send("Donne une **mention** ou un **ID**. Ex: `!owner 425450624461701130`"); return
+    membre = await resoudre_cible(ctx, ref)
+    if membre is None:
+        await ctx.send("❌ Utilisateur introuvable."); return
     if membre.id == BUYER_ID:
         await ctx.send("Tu es le buyer."); return
     if membre.id in OWNERS:
@@ -2604,7 +2657,10 @@ async def owner_cmd(ctx, membre: discord.User):
 
 @bot.command(name="unowner")
 @check_buyer()
-async def unowner_cmd(ctx, membre: discord.User):
+async def unowner_cmd(ctx, *, ref: str = None):
+    membre = await resoudre_cible(ctx, ref) if ref else None
+    if membre is None:
+        await ctx.send("Donne une **mention** ou un **ID**. Ex: `!unowner 425450624461701130`"); return
     if membre.id == BUYER_ID:
         await ctx.send("Le buyer ne peut pas etre retire."); return
     if membre.id not in OWNERS:
