@@ -2,6 +2,8 @@
 ================================================================================
   BOT DISCORD - DETECTION DE COMPTES RARES (version enrichie)
   buyer/owner · SQLite · !set/!scan par categorie · boost · niveau de rarete
+  + MODERATION : ban / unban / mute / unmute / tempmute (par ID ou mention,
+    meme si la personne n'est PAS sur le serveur)
 ================================================================================
 NOTE: les badges Nitro (Bronze..Opale) ne sont PAS exposes par l'API Discord et
 ne peuvent donc pas etre detectes par un bot. On detecte uniquement le BOOST de
@@ -161,6 +163,9 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS bios     (user_id INTEGER PRIMARY KEY, texte TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS couleurs (user_id INTEGER PRIMARY KEY, couleur TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS fonds_membres (user_id INTEGER PRIMARY KEY, data BLOB)")
+    # Mutes persistants (survivent au redemarrage)
+    conn.execute("CREATE TABLE IF NOT EXISTS mutes (guild_id INTEGER, user_id INTEGER, "
+                 "until INTEGER, reason TEXT, PRIMARY KEY (guild_id, user_id))")
     conn.commit(); conn.close()
 
 
@@ -316,6 +321,41 @@ def couleur_membre(uid):
         return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
     except Exception:
         return None
+
+
+# --- Mutes (base) ---
+def db_ajouter_mute(gid, uid, until, reason):
+    conn = db()
+    conn.execute("INSERT INTO mutes (guild_id,user_id,until,reason) VALUES (?,?,?,?) "
+                 "ON CONFLICT(guild_id,user_id) DO UPDATE SET until=excluded.until, reason=excluded.reason",
+                 (gid, uid, until, reason))
+    conn.commit(); conn.close()
+
+
+def db_retirer_mute(gid, uid):
+    conn = db(); conn.execute("DELETE FROM mutes WHERE guild_id=? AND user_id=?", (gid, uid))
+    conn.commit(); conn.close()
+
+
+def db_info_mute(gid, uid):
+    conn = db()
+    row = conn.execute("SELECT until, reason FROM mutes WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
+    conn.close()
+    return row  # (until, reason) ou None
+
+
+def db_tous_mutes():
+    conn = db()
+    rows = conn.execute("SELECT guild_id, user_id, until, reason FROM mutes").fetchall()
+    conn.close()
+    return rows
+
+
+def db_mutes_guild(gid):
+    conn = db()
+    rows = conn.execute("SELECT user_id, until, reason FROM mutes WHERE guild_id=?", (gid,)).fetchall()
+    conn.close()
+    return rows
 
 
 FAME_PALIERS = [(100, "Icône"), (40, "Légende"), (15, "Star"), (5, "Populaire"), (1, "Connu"), (0, "Inconnu")]
@@ -1847,6 +1887,13 @@ HELP_CATEGORIES = {
         ("!owners", "Buyer + owners."),
     ],
     "🛠️ Moderation": [
+        ("!ban <@/id> [raison]", "Bannit (par ID, marche meme si la personne n'est pas sur le serveur)."),
+        ("!unban <id> [raison]", "Debannit par ID (ou pseudo exact d'un banni)."),
+        ("!mute <@/id> [raison]", "Mute permanent (s'applique a l'arrivee si la personne est absente)."),
+        ("!tempmute <@/id> <duree> [raison]", "Mute temporaire (30s, 10m, 2h, 1j, 1sem, ou 1h30m)."),
+        ("!unmute <@/id>", "Retire le mute (permanent ou temporaire)."),
+        ("!mutes", "Liste des personnes actuellement mute."),
+        ("!setmute [@role]", "Definit (ou cree) le role de mute."),
         ("!nuke", "Supprime et recree le salon a l'identique (renew)."),
         ("!clear [n|@membre]", "Purge : 100 derniers, un nombre (1-100), ou les messages d'un membre."),
         ("!allow [#salon]", "Ouvre un salon aux commandes publiques."),
@@ -2081,6 +2128,157 @@ class EmojiItemView(AuthorView):
         super().__init__(author, guild)
         self.add_item(EmojiItemSelect(cat))
         self.add_item(RetourEmojiBouton())
+
+
+# ==============================================================================
+#  MODERATION : OUTILS (ban / mute / tempmute)
+# ==============================================================================
+
+def _now_ts():
+    return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+
+def parse_duree(s):
+    """'30s' '10m' '2h' '1j' '1sem' ou combine '1h30m'. Un nombre seul = minutes. -> secondes ou None."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    if s.isdigit():
+        return int(s) * 60
+    unites = {"sem": 604800, "w": 604800, "j": 86400, "d": 86400, "h": 3600, "m": 60, "s": 1}
+    total = 0
+    for n, u in re.findall(r"(\d+)\s*(sem|w|j|d|h|m|s)", s):
+        total += int(n) * unites[u]
+    return total or None
+
+
+def format_duree(sec):
+    sec = int(sec)
+    if sec <= 0:
+        return "0s"
+    parts = []
+    for nom, val in (("j", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        if sec >= val:
+            q, sec = divmod(sec, val)
+            parts.append(f"{q}{nom}")
+    return " ".join(parts)
+
+
+def extraire_id(ref):
+    """Renvoie l'ID depuis une mention <@123> ou un ID brut, sinon None."""
+    if ref is None:
+        return None
+    s = str(ref).strip()
+    m = re.match(r"^<@!?(\d+)>$", s)
+    if m:
+        return int(m.group(1))
+    if s.isdigit():
+        return int(s)
+    return None
+
+
+async def resoudre_id_ou_user(ctx, ref):
+    """Renvoie (uid, member_ou_user_ou_None). L'uid peut etre valide meme si la personne
+    n'est pas sur le serveur (resolu via fetch_user). Accepte mention / ID / pseudo (membres)."""
+    uid = extraire_id(ref)
+    if uid is not None:
+        membre = ctx.guild.get_member(uid) if ctx.guild else None
+        if membre:
+            return uid, membre
+        try:
+            return uid, await bot.fetch_user(uid)
+        except Exception:
+            return uid, None
+    membre = await resoudre_cible(ctx, ref)
+    if membre:
+        return membre.id, membre
+    return None, None
+
+
+async def obtenir_role_mute(guild):
+    """Recupere le role de mute configure, sinon le cree (et coupe la parole partout)."""
+    rid = CONFIG.get("muterole", 0)
+    role = guild.get_role(rid) if rid else None
+    if role:
+        return role
+    role = discord.utils.get(guild.roles, name="Muted")
+    if role is None:
+        try:
+            role = await guild.create_role(name="Muted", colour=discord.Color.dark_grey(),
+                                           reason="Role de mute (auto)")
+        except discord.Forbidden:
+            return None
+        for ch in guild.channels:
+            try:
+                await ch.set_permissions(role, send_messages=False, add_reactions=False, speak=False,
+                                         create_public_threads=False, create_private_threads=False,
+                                         send_messages_in_threads=False)
+            except Exception:
+                pass
+    definir_config("muterole", role.id)
+    return role
+
+
+_taches_unmute = {}
+
+
+def _annuler_tache(gid, uid):
+    t = _taches_unmute.pop((gid, uid), None)
+    if t and not t.done():
+        t.cancel()
+
+
+async def _appliquer_mute(member, until):
+    """Pose le role Muted. Si tempmute <= 28j, ajoute aussi le timeout natif Discord."""
+    role = await obtenir_role_mute(member.guild)
+    if role and role not in member.roles:
+        try:
+            await member.add_roles(role, reason="Mute")
+        except discord.HTTPException:
+            pass
+    if until:
+        restant = until - _now_ts()
+        if 0 < restant <= 28 * 86400:
+            try:
+                fin = datetime.datetime.fromtimestamp(until, datetime.timezone.utc)
+                await member.timeout(fin, reason="Tempmute")
+            except Exception:
+                pass
+
+
+async def _retirer_mute(guild, uid):
+    db_retirer_mute(guild.id, uid)
+    _annuler_tache(guild.id, uid)
+    member = guild.get_member(uid)
+    if member:
+        role = guild.get_role(CONFIG.get("muterole", 0))
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Unmute")
+            except discord.HTTPException:
+                pass
+        try:
+            if member.is_timed_out():
+                await member.timeout(None, reason="Unmute")
+        except Exception:
+            pass
+
+
+def _planifier_unmute(guild_id, uid, until):
+    _annuler_tache(guild_id, uid)
+
+    async def _job():
+        try:
+            await asyncio.sleep(max(0, until - _now_ts()))
+            guild = bot.get_guild(guild_id)
+            if guild:
+                await _retirer_mute(guild, uid)
+            else:
+                db_retirer_mute(guild_id, uid)
+        except asyncio.CancelledError:
+            pass
+
+    _taches_unmute[(guild_id, uid)] = bot.loop.create_task(_job())
 
 
 # ==============================================================================
@@ -2535,6 +2733,179 @@ async def bareme(ctx):
 
 
 # ==============================================================================
+#  COMMANDES MODERATION : BAN / UNBAN / MUTE / UNMUTE / TEMPMUTE
+# ==============================================================================
+
+@bot.command(name="ban")
+@check_owner()
+async def ban_cmd(ctx, cible: str = None, *, raison: str = "Aucune raison fournie."):
+    """!ban <@membre|id> [raison] — marche meme si la personne n'est PAS sur le serveur (via ID)."""
+    if cible is None:
+        await ctx.send("Utilisation : `!ban <@membre|id> [raison]`"); return
+    uid, user = await resoudre_id_ou_user(ctx, cible)
+    if uid is None:
+        await ctx.send("❌ Cible introuvable. Donne une **mention**, un **ID** ou un **pseudo** (membre present)."); return
+    if uid == BUYER_ID or uid in OWNERS:
+        await ctx.send("⛔ Impossible de bannir un owner/buyer."); return
+    if uid == ctx.author.id:
+        await ctx.send("Tu ne peux pas te bannir toi-meme."); return
+    nom = str(user) if user else f"ID {uid}"
+    try:
+        await ctx.guild.ban(discord.Object(id=uid), reason=f"{raison} — par {ctx.author}", delete_message_days=0)
+    except discord.Forbidden:
+        await ctx.send("⛔ Permission **Bannir des membres** manquante, ou role du bot trop bas."); return
+    except discord.HTTPException as e:
+        await ctx.send(f"Erreur API : {e}"); return
+    db_retirer_mute(ctx.guild.id, uid); _annuler_tache(ctx.guild.id, uid)
+    e = discord.Embed(title="🔨 Membre banni", color=discord.Color.red(),
+                      description=f"**{nom}** (`{uid}`)\n**Raison :** {raison}")
+    if not user or ctx.guild.get_member(uid) is None:
+        e.set_footer(text="Ban par ID (la personne n'etait pas forcement sur le serveur).")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="unban")
+@check_owner()
+async def unban_cmd(ctx, cible: str = None, *, raison: str = "Aucune raison fournie."):
+    """!unban <id> (recommande) ou pseudo exact / pseudo#0000 d'un membre banni."""
+    if cible is None:
+        await ctx.send("Utilisation : `!unban <id>` (ou pseudo exact d'un banni)"); return
+    uid = extraire_id(cible)
+    if uid is None:
+        s = cible.strip().lower()
+        try:
+            async for ban_entry in ctx.guild.bans():
+                u = ban_entry.user
+                if str(u).lower() == s or u.name.lower() == s or str(u.id) == s:
+                    uid = u.id; break
+        except discord.Forbidden:
+            await ctx.send("⛔ Permission **Bannir des membres** manquante (lecture des bans)."); return
+    if uid is None:
+        await ctx.send("❌ Donne un **ID** valide (recommande) ou le pseudo exact d'un membre banni."); return
+    try:
+        await ctx.guild.unban(discord.Object(id=uid), reason=f"{raison} — par {ctx.author}")
+    except discord.NotFound:
+        await ctx.send("ℹ️ Cet utilisateur n'est pas banni."); return
+    except discord.Forbidden:
+        await ctx.send("⛔ Permission **Bannir des membres** manquante."); return
+    except discord.HTTPException as e:
+        await ctx.send(f"Erreur API : {e}"); return
+    await ctx.send(embed=discord.Embed(title="♻️ Debannissement",
+                   description=f"<@{uid}> (`{uid}`) a ete debanni.", color=discord.Color.green()))
+
+
+@bot.command(name="setmute", aliases=["setmuterole"])
+@check_owner()
+async def setmute_cmd(ctx, role: discord.Role = None):
+    """Definit (ou cree) le role de mute. !setmute @role, ou !setmute seul pour auto-creer."""
+    if role is None:
+        r = await obtenir_role_mute(ctx.guild)
+        if r is None:
+            await ctx.send("⛔ Je ne peux pas creer le role **Muted** (permission **Gerer les roles** manquante).\n"
+                           "Cree-le a la main puis fais `!setmute @role`."); return
+        await ctx.send(f"✅ Role de mute : {r.mention} (auto). Tu peux le changer avec `!setmute @role`."); return
+    definir_config("muterole", role.id)
+    await ctx.send(f"✅ Role de mute defini : {role.mention}")
+
+
+@bot.command(name="mute")
+@check_owner()
+async def mute_cmd(ctx, cible: str = None, *, raison: str = "Aucune raison fournie."):
+    """!mute <@membre|id> [raison] — mute permanent. S'applique aussi a une personne hors serveur (a son arrivee)."""
+    if cible is None:
+        await ctx.send("Utilisation : `!mute <@membre|id> [raison]`"); return
+    uid, user = await resoudre_id_ou_user(ctx, cible)
+    if uid is None:
+        await ctx.send("❌ Cible introuvable. Donne une **mention**, un **ID** ou un **pseudo**."); return
+    if uid == BUYER_ID or uid in OWNERS:
+        await ctx.send("⛔ Impossible de mute un owner/buyer."); return
+    db_ajouter_mute(ctx.guild.id, uid, None, raison)
+    _annuler_tache(ctx.guild.id, uid)
+    member = ctx.guild.get_member(uid)
+    if member:
+        await _appliquer_mute(member, None)
+        cible_txt = member.mention
+    else:
+        cible_txt = f"<@{uid}> (`{uid}`)"
+    e = discord.Embed(title="🔇 Membre mute", color=discord.Color.dark_grey(),
+                      description=f"{cible_txt}\n**Duree :** permanent\n**Raison :** {raison}")
+    if not member:
+        e.set_footer(text="Pas sur le serveur : le mute s'appliquera des son arrivee.")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="tempmute", aliases=["mutetemp"])
+@check_owner()
+async def tempmute_cmd(ctx, cible: str = None, duree: str = None, *, raison: str = "Aucune raison fournie."):
+    """!tempmute <@membre|id> <duree> [raison]. Durees : 30s, 10m, 2h, 1j, 1sem, ou combine 1h30m."""
+    if cible is None or duree is None:
+        await ctx.send("Utilisation : `!tempmute <@membre|id> <duree> [raison]`\n"
+                       "Durees : `30s`, `10m`, `2h`, `1j`, `1sem`, ou combine `1h30m`."); return
+    sec = parse_duree(duree)
+    if not sec:
+        await ctx.send("❌ Duree invalide. Ex : `10m`, `2h`, `1j`, `1h30m`."); return
+    uid, user = await resoudre_id_ou_user(ctx, cible)
+    if uid is None:
+        await ctx.send("❌ Cible introuvable."); return
+    if uid == BUYER_ID or uid in OWNERS:
+        await ctx.send("⛔ Impossible de mute un owner/buyer."); return
+    until = _now_ts() + sec
+    db_ajouter_mute(ctx.guild.id, uid, until, raison)
+    member = ctx.guild.get_member(uid)
+    if member:
+        await _appliquer_mute(member, until)
+        cible_txt = member.mention
+    else:
+        cible_txt = f"<@{uid}> (`{uid}`)"
+    _planifier_unmute(ctx.guild.id, uid, until)
+    e = discord.Embed(title="🔇 Membre mute (temporaire)", color=discord.Color.dark_grey(),
+                      description=f"{cible_txt}\n**Duree :** {format_duree(sec)}\n"
+                                  f"**Fin :** <t:{until}:R>\n**Raison :** {raison}")
+    if not member:
+        e.set_footer(text="Pas sur le serveur : le mute s'appliquera des son arrivee.")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="unmute", aliases=["demute", "untempmute"])
+@check_owner()
+async def unmute_cmd(ctx, cible: str = None):
+    """!unmute <@membre|id> — retire le mute (permanent ou temporaire)."""
+    if cible is None:
+        await ctx.send("Utilisation : `!unmute <@membre|id>`"); return
+    uid, _user = await resoudre_id_ou_user(ctx, cible)
+    if uid is None:
+        uid = extraire_id(cible)
+    if uid is None:
+        await ctx.send("❌ Cible introuvable."); return
+    avait = db_info_mute(ctx.guild.id, uid) is not None
+    await _retirer_mute(ctx.guild, uid)
+    if avait:
+        await ctx.send(embed=discord.Embed(title="🔊 Mute retire",
+                       description=f"<@{uid}> n'est plus mute.", color=discord.Color.green()))
+    else:
+        await ctx.send(f"ℹ️ <@{uid}> n'etait pas enregistre comme mute (j'ai quand meme nettoye le role/timeout si present).")
+
+
+@bot.command(name="mutes")
+@check_owner()
+async def mutes_cmd(ctx):
+    """Liste les personnes actuellement mute sur ce serveur."""
+    rows = db_mutes_guild(ctx.guild.id)
+    if not rows:
+        await ctx.send("Aucune personne mute actuellement."); return
+    lignes = []
+    for uid, until, raison in rows:
+        if until:
+            duree = f"jusqu'a <t:{until}:R>"
+        else:
+            duree = "permanent"
+        rs = f" — {raison}" if raison else ""
+        lignes.append(f"<@{uid}> (`{uid}`) — {duree}{rs}")
+    view = PageView(ctx.author, ctx.guild, "🔇 Personnes mute", lignes, discord.Color.dark_grey())
+    await ctx.send(embed=view.embed_courant(), view=view if view.total_pages > 1 else None)
+
+
+# ==============================================================================
 #  MODERATION / SALONS
 # ==============================================================================
 
@@ -2707,6 +3078,16 @@ async def on_ready():
     if not WORDFREQ_OK:
         print("/!\\ wordfreq non installe : detection des mots desactivee.")
     print(f"Buyer : {BUYER_ID} | Owners : {len(OWNERS)}")
+    # Reprise des mutes : nettoie les expires, replanifie les fins en cours.
+    for gid, uid, until, _ in db_tous_mutes():
+        if until and until <= _now_ts():
+            guild = bot.get_guild(gid)
+            if guild:
+                await _retirer_mute(guild, uid)
+            else:
+                db_retirer_mute(gid, uid)
+        elif until:
+            _planifier_unmute(gid, uid, until)
 
 
 @bot.event
@@ -2718,6 +3099,16 @@ async def on_member_join(member):
     await attribuer_roles_depuis(member, infos)      # attribue les roles
     if est_notable(infos):
         await envoyer_log_join(member.guild, member, infos, u)
+    # Re-applique un mute en attente si la personne etait mute (meme en etant partie/absente).
+    info_mute = db_info_mute(member.guild.id, member.id)
+    if info_mute:
+        until, _ = info_mute
+        if until and until <= _now_ts():
+            await _retirer_mute(member.guild, member.id)
+        else:
+            await _appliquer_mute(member, until)
+            if until:
+                _planifier_unmute(member.guild.id, member.id, until)
 
 
 @bot.event
