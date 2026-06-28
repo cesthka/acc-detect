@@ -559,12 +559,18 @@ def members_with(guild, key):
     return [m for m in guild.members if not m.bot and member_has_key(m, key)]
 
 
-async def assign_roles_from(member, info):
+def criteria_keys(info):
+    """All detectable criterion keys the member currently has (badges + username + age + boost)."""
     keys = list(info["badges"]) + list(info["pseudo"])
     for extra in (info["anciennete"], info["boost"]):
         if extra:
             keys.append(extra)
-    role_ids = {CONFIG.get(c, 0) for c in keys}
+    return keys
+
+
+async def assign_roles_from(member, info):
+    """Assign the BASE roles (configured via !set). Add-only: never removes a base role."""
+    role_ids = {CONFIG.get(c, 0) for c in criteria_keys(info)}
     role_ids.discard(0)
     roles = [r for rid in role_ids if (r := member.guild.get_role(rid)) and r not in member.roles]
     if roles:
@@ -576,9 +582,55 @@ async def assign_roles_from(member, info):
             info["erreurs"].append(f"API error: {e}")
 
 
+def vip_key(key):
+    """Config key holding the server-tag VIP role for a criterion (configured via !tag)."""
+    return f"{key}_vip"
+
+
+def wears_server_tag(member):
+    """True if the member currently displays THIS server's tag (a.k.a. primary guild).
+    Requires discord.py 2.6+ (Member.primary_guild). Safe no-op on older versions / off-server."""
+    pg = getattr(member, "primary_guild", None)
+    guild = getattr(member, "guild", None)
+    if not pg or guild is None:
+        return False
+    return getattr(pg, "id", None) == guild.id and bool(getattr(pg, "identity_enabled", False))
+
+
+async def sync_vip_roles(member, info):
+    """Server-tag VIP layer. ADDITIVE and reversible — it never touches the base roles:
+      - member HAS the criterion AND wears the server tag  -> ADD the VIP role (set via !tag)
+      - no tag (or the criterion is gone)                  -> REMOVE the VIP role
+    Only configured VIP roles are ever added/removed here."""
+    has_tag = wears_server_tag(member)
+    member_keys = set(criteria_keys(info))
+    add_ids, remove_ids = set(), set()
+    for k in DETECT_KEYS:
+        vid = CONFIG.get(vip_key(k), 0)
+        if not vid:
+            continue
+        if has_tag and k in member_keys:
+            add_ids.add(vid)
+        else:
+            remove_ids.add(vid)
+    remove_ids -= add_ids  # safety: never remove a role that's wanted for another criterion
+    to_add = [r for rid in add_ids if (r := member.guild.get_role(rid)) and r not in member.roles]
+    to_remove = [r for rid in remove_ids if (r := member.guild.get_role(rid)) and r in member.roles]
+    try:
+        if to_add:
+            await member.add_roles(*to_add, reason="Server tag VIP")
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Server tag removed (VIP)")
+    except discord.Forbidden:
+        info["erreurs"].append("Missing 'Manage Roles' permission, or the bot's role is too low.")
+    except discord.HTTPException as e:
+        info["erreurs"].append(f"API error: {e}")
+
+
 async def apply_roles(member):
     info = collect_info(member)
-    await assign_roles_from(member, info)
+    await assign_roles_from(member, info)   # base roles (!set)
+    await sync_vip_roles(member, info)      # server-tag VIP roles (!tag)
     return info
 
 
@@ -977,7 +1029,8 @@ HELP_OWNER = {
         ("!bareme", "Rarity scale (menu by category)."),
     ],
     "⚙️ Configuration": [
-        ("!set", "Interactive panel (roles, channels, alerts)."),
+        ("!set", "Interactive panel: BASE roles, channels, alerts."),
+        ("!tag", "Like !set, for the SUPERIOR roles added when a member wears the server tag."),
         ("!config", "Show the configuration."),
         ("!setlog #channel", "Joins channel."),
         ("!setscan #channel", "Scans channel."),
@@ -1242,6 +1295,118 @@ class EmojiItemView(AuthorView):
         self.add_item(BackEmojiButton())
 
 
+# --- !tag : same flow as !set, but for the SUPERIOR (VIP) roles given with the server tag ---
+# Base roles stay configured by !set; these are added ON TOP when the member wears the tag.
+
+def tag_value(guild, key):
+    rid = CONFIG.get(vip_key(key), 0)
+    if not rid:
+        return "*not set*"
+    role = guild.get_role(rid)
+    return role.mention if role else "*not found*"
+
+
+def tag_home_embed():
+    e = discord.Embed(
+        title="🏷️ Server-tag VIP roles",
+        description="Same idea as `!set`, but here you set the **superior role** added **on top** "
+                    "when a member has the criterion **and** wears the server tag.\n"
+                    "The base role (from `!set`) is kept; this one is added/removed automatically with the tag.\n\n"
+                    "Pick a category below.",
+        color=discord.Color.blurple())
+    e.add_field(name="Categories", value="\n".join(f"• {c}" for c in SCAN_CATEGORIES), inline=False)
+    return e
+
+
+def tag_cat_embed(guild, cat):
+    e = discord.Embed(title=f"🏷️ {cat} — VIP (tag) roles",
+                      description="Choose the criterion to set its tag role.",
+                      color=discord.Color.blurple())
+    lines = []
+    for k in SCAN_CATEGORIES[cat]:
+        pref = emoji_of(k) + " " if k in DEFAULT_EMOJIS else ""
+        lines.append(f"{pref}**{SET_ITEMS[k]['label']}** → {tag_value(guild, k)}")
+    e.add_field(name="Current state", value="\n".join(lines), inline=False)
+    return e
+
+
+class TagCategorySelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="Choose a category…",
+                         options=[discord.SelectOption(label=c, value=c) for c in SCAN_CATEGORIES])
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            embed=tag_cat_embed(self.view.guild, self.values[0]),
+            view=TagItemView(self.view.author, self.view.guild, self.values[0]))
+
+
+class TagConfigView(AuthorView):
+    def __init__(self, author, guild):
+        super().__init__(author, guild)
+        self.add_item(TagCategorySelect())
+
+
+class TagItemSelect(discord.ui.Select):
+    def __init__(self, cat):
+        super().__init__(placeholder=f"{cat} — choose the criterion…",
+                         options=[discord.SelectOption(label=SET_ITEMS[k]["label"], value=k)
+                                  for k in SCAN_CATEGORIES[cat]])
+
+    async def callback(self, interaction):
+        key = self.values[0]
+        embed = discord.Embed(
+            title=f"VIP role (tag): {SET_ITEMS[key]['label']}",
+            description="Choose the role added when this criterion is present **and** the server tag is worn.",
+            color=discord.Color.blurple())
+        await interaction.response.edit_message(
+            embed=embed, view=TagRolePickView(self.view.author, self.view.guild, key))
+
+
+class TagBackToConfig(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="◀ Back", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(embed=tag_home_embed(),
+                                                view=TagConfigView(self.view.author, self.view.guild))
+
+
+class TagItemView(AuthorView):
+    def __init__(self, author, guild, cat):
+        super().__init__(author, guild)
+        self.add_item(TagItemSelect(cat))
+        self.add_item(TagBackToConfig())
+
+
+class TagRolePicker(discord.ui.RoleSelect):
+    def __init__(self, key):
+        self.key = key
+        super().__init__(placeholder="Search a role…", min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        role = self.values[0]
+        set_config(vip_key(self.key), role.id)
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="✅ Done",
+                                description=f"**{SET_ITEMS[self.key]['label']}** — VIP (tag) → {role.mention}",
+                                color=discord.Color.green()),
+            view=TagBackView(self.view.author, self.view.guild))
+
+
+class TagRolePickView(AuthorView):
+    def __init__(self, author, guild, key):
+        super().__init__(author, guild)
+        self.add_item(TagRolePicker(key))
+        self.add_item(TagBackToConfig())
+
+
+class TagBackView(AuthorView):
+    def __init__(self, author, guild):
+        super().__init__(author, guild)
+        self.add_item(TagBackToConfig())
+
+
 # ==============================================================================
 #  MODERATION: TOOLS (ban / mute / tempmute)
 # ==============================================================================
@@ -1402,6 +1567,14 @@ def _schedule_unmute(guild_id, uid, until):
 @check_owner()
 async def set_cmd(ctx):
     await ctx.send(embed=config_home_embed(), view=ConfigView(ctx.author, ctx.guild))
+
+
+@bot.command(name="tag")
+@check_owner()
+async def tag_cmd(ctx):
+    """Configure the SUPERIOR (VIP) roles added on top when a member wears the server tag.
+    Same flow as !set; the base roles stay configured with !set."""
+    await ctx.send(embed=tag_home_embed(), view=TagConfigView(ctx.author, ctx.guild))
 
 
 @bot.command(name="config")
@@ -1958,6 +2131,9 @@ async def on_ready():
     print(f"Bot connected: {bot.user} (id {bot.user.id})")
     if not WORDFREQ_OK:
         print("/!\\ wordfreq not installed: word detection disabled.")
+    if discord.version_info < (2, 6, 0):
+        print("/!\\ discord.py < 2.6: server-tag (primary_guild) detection unavailable; "
+              "!tag VIP roles won't be applied. Upgrade: pip install -U discord.py")
     print(f"Buyer: {BUYER_ID} | Owners: {len(OWNERS)}")
     # Mute recovery: clean up expired ones, reschedule the ones still running.
     for gid, uid, until, _ in db_all_mutes():
@@ -1977,7 +2153,8 @@ async def on_member_join(member):
         return
     info = collect_info(member)
     u = await fetch_full_user(member)              # for the banner in the log
-    await assign_roles_from(member, info)          # assign roles
+    await assign_roles_from(member, info)          # base roles
+    await sync_vip_roles(member, info)             # server-tag VIP roles
     if is_notable(info):
         await send_join_log(member.guild, member, info, u)
     # Re-apply a pending mute if the person was muted (even if they had left / were absent).
